@@ -1,0 +1,58 @@
+{
+  "artifact": "poa_base_network.gpkg",
+  "layer": "segments",
+  "written_utc": "2026-08-26T13:26:24+00:00",
+  "purpose": "base network input for the Porto Alegre reproduction pipeline",
+  "derived_from": {
+    "path": "data/frozen/segments/edges_combined.shp",
+    "sha256": "8443a2aa542575005dd0c146c410c57073b9871ce45babba00f88e5cb8fcc4a8",
+    "crs": "EPSG:32722",
+    "features": 65357
+  },
+  "crs": "EPSG:32722",
+  "columns": {
+    "node1/node2": "segment key, unique, carried through unchanged",
+    "dist": "segment length in metres",
+    "speed": "km/h; cost = dist / (speed/60), i.e. metre-equivalents at 60 km/h",
+    "area": "static weight R (buildable area, 30 m buffer); 0 = routes but not a zone",
+    "geometry": "one LineString per segment, EPSG:32722"
+  },
+  "counts": {
+    "segments": 65357,
+    "zones (area > 0)": 56162,
+    "zero-capacity segments": 9195,
+    "sum_R": 243801729.95161343
+  },
+  "model_reconstruction": {
+    "graph": "split every segment at its midpoint; endpoints and midpoints are nodes",
+    "zone_position": "midpoint of its own segment (measured 0.500000)",
+    "connector_cost": 0.0,
+    "kernel": "(cost + d0)^(-beta), zero diagonal (self_interaction=False)",
+    "submitted_run": {
+      "gamma": [
+        1,
+        0
+      ],
+      "beta": 2.0,
+      "d0": 5000.0,
+      "iterations": 200,
+      "stop": "budget_only",
+      "a0": "R",
+      "normalization": "l1_2024"
+    }
+  },
+  "verification": {
+    "reproduces": [
+      "cd1g1b2k0",
+      "cd4g0b2k0",
+      "ca1g1b2k0",
+      "ca4g0b2k0"
+    ],
+    "within_0.1pct": 1.0,
+    "median_relative_error": {
+      "PC1": 2.2e-14,
+      "PC2": 8.9e-15
+    },
+    "note": "result columns are deliberately absent here; scored against the submitted columns by data/frozen/network/reconstruct_paper_run.py"
+  }
+}

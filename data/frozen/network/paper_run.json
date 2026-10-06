@@ -1,0 +1,114 @@
+{
+  "source": {
+    "source": "data/frozen/segments/edges_combined.shp",
+    "source_sha256": "8443a2aa542575005dd0c146c410c57073b9871ce45babba00f88e5cb8fcc4a8",
+    "crs": "EPSG:32722",
+    "n_segments": 65357,
+    "n_endpoints": 45673,
+    "graph_nodes": 111030,
+    "graph_edges": 130714,
+    "n_zones": 56162,
+    "zero_capacity_segments": 9195,
+    "self_loop_segments": 53,
+    "self_loop_segments_with_zone": 47,
+    "sum_R": 243801729.95161343,
+    "speeds": [
+      5.0,
+      10.0,
+      20.0,
+      30.0,
+      40.0,
+      50.0,
+      60.0,
+      70.0,
+      80.0,
+      90.0,
+      100.0,
+      110.0
+    ],
+    "cost_units": "metre-equivalents at 60 km/h (1000 per minute)",
+    "speed_reference_kmh": 60.0,
+    "midpoint_rule": "zone at fraction 0.5 of its segment; connector cost 0",
+    "reference_columns": [
+      "cd1g1b2k0",
+      "ca1g1b2k0",
+      "cd4g0b2k0",
+      "ca4g0b2k0"
+    ]
+  },
+  "iterations": 200,
+  "cases": [
+    {
+      "label": "PC1",
+      "gamma": 1.0,
+      "beta": 2.0,
+      "d0": 5000.0,
+      "status": "FIXED_BUDGET",
+      "final_step_norm": 2.1573065506196708e-05,
+      "wall_seconds": 99.6,
+      "sum_mass": 243801729.9516134,
+      "sum_R": 243801729.95161343,
+      "density_vs_cd1g1b2k0": {
+        "rows": 65357,
+        "both_zero": 9195,
+        "compared": 56162,
+        "within_0.1pct": 1.0,
+        "within_1pct": 1.0,
+        "median_rel": 2.23574247196373e-14,
+        "p90_rel": 2.3955786718801024e-13,
+        "p99_rel": 6.086093337617701e-13,
+        "max_rel": 1.5935345412077906e-12,
+        "pearson": 1.0
+      },
+      "mass_vs_ca1g1b2k0": {
+        "rows": 65357,
+        "both_zero": 9195,
+        "compared": 56162,
+        "within_0.1pct": 1.0,
+        "within_1pct": 1.0,
+        "median_rel": 2.2354923423623e-14,
+        "p90_rel": 2.395945413180505e-13,
+        "p99_rel": 6.084501045719453e-13,
+        "max_rel": 1.5934571968104525e-12,
+        "pearson": 1.0
+      },
+      "manifest_sha256": "1245570ff9b72f65ea65e4796b126041c666759f8280d1c9c699a1516b9c451e"
+    },
+    {
+      "label": "PC2",
+      "gamma": 0.0,
+      "beta": 2.0,
+      "d0": 5000.0,
+      "status": "FIXED_BUDGET",
+      "final_step_norm": 1.67608462667131e-15,
+      "wall_seconds": 92.9,
+      "sum_mass": 243801729.9516134,
+      "sum_R": 243801729.95161343,
+      "density_vs_cd4g0b2k0": {
+        "rows": 65357,
+        "both_zero": 9195,
+        "compared": 56162,
+        "within_0.1pct": 1.0,
+        "within_1pct": 1.0,
+        "median_rel": 8.910875918200927e-15,
+        "p90_rel": 1.2390304622349672e-13,
+        "p99_rel": 2.193461533459975e-13,
+        "max_rel": 4.313458554556721e-13,
+        "pearson": 1.0
+      },
+      "mass_vs_ca4g0b2k0": {
+        "rows": 65357,
+        "both_zero": 9195,
+        "compared": 56162,
+        "within_0.1pct": 1.0,
+        "within_1pct": 1.0,
+        "median_rel": 8.8920514016771e-15,
+        "p90_rel": 1.2388388257376892e-13,
+        "p99_rel": 2.193704861473291e-13,
+        "max_rel": 4.315177773457098e-13,
+        "pearson": 1.0
+      },
+      "manifest_sha256": "f8210c1f5495a0256dcb428660f3903417ea2dc9357a6d1c82497826ee922527"
+    }
+  ]
+}

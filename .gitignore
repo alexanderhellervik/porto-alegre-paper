@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Regenerable. Everything below is produced by `make`; the inputs it is
+# produced from (data/raw, data/frozen, env/) are tracked, with their checksums
+# in data/SHA256SUMS.
+# ---------------------------------------------------------------------------
+data/interim/*
+!data/interim/.gitkeep
+# data/interim also holds the run manifests (`*_manifest.json`): the
+# parameters, input checksums, wall time and argv behind each artefact. They
+# describe a particular run and are written by it, so they are not tracked.
+
+outputs/*
+!outputs/.gitkeep
+!outputs/tables/
+outputs/tables/*
+!outputs/tables/.gitkeep
+# The purpose -> category mapping is an input to stage 1, which checks that
+# the rules in config.yaml still reproduce it. `make profile` regenerates it.
+!outputs/tables/stage0b_purpose_mapping.csv
+
+# Run logs, including the per-run environment record in logs/env/
+# (`make env` copies it into env/).
+logs/*
+!logs/.gitkeep
+
+# Generated analysis reports (stage*.md).
+reports/*
+!reports/.gitkeep
+
+# GAUS Lines v1.1, fetched by `make gaus-fetch` and not redistributed: the
+# upstream repository carries no licence file.
+tools/GAUS/
+
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.ruff_cache/
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store

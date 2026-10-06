@@ -1,0 +1,1660 @@
+# =============================================================================
+# config.yaml — Land value vs. spatial centrality (Porto Alegre)
+#
+# Every analytical convention of the pipeline is set here: inputs, column
+# names, the dependent-variable construction, the exclusion order, the weight
+# matrices, the estimator settings and the revision analyses. The scripts in
+# src/ read their settings from this file; the comments explain what each value
+# means and, where it is not obvious, why it has the value it has.
+# =============================================================================
+
+project:
+  name: porto-alegre-centrality-landvalue
+
+# -----------------------------------------------------------------------------
+# Compute limits. Every parallel section reads `max_workers`, and the Makefile
+# uses it to cap the BLAS/OpenMP thread pools underneath R and numpy.
+#
+# The shipped value is a conservative default, not a measurement of your
+# machine. To find your real limit read /sys/fs/cgroup/cpu.max and
+# /sys/fs/cgroup/memory.max (or your scheduler's limits): inside a container
+# `nproc` and `free` report the host, not the quota, and a pool sized from them
+# oversubscribes the CPUs you actually have.
+#
+# `host_ceiling` and `memory_gib` describe the machine the runs of record were
+# made on (32 workers at most, 96 GiB); the scripts that take a worker count
+# check it against `host_ceiling`.
+# -----------------------------------------------------------------------------
+compute:
+  max_workers: 8
+  host_ceiling: 32
+
+# -----------------------------------------------------------------------------
+# Reproducibility
+# -----------------------------------------------------------------------------
+repro:
+  seed: 20260820
+  crs_epsg: 31982          # SIRGAS 2000 / UTM 22S: metric, required for kNN
+  checksum_algo: sha256
+  # A GeoPackage stores a write timestamp in `gpkg_contents.last_change`, so two
+  # identical writes would hash differently. Every GeoPackage the pipeline
+  # writes is stamped with this fixed value and VACUUMed, which makes its bytes
+  # a function of the data alone.
+  gpkg_last_change: "1970-01-01T00:00:00.000Z"
+
+# -----------------------------------------------------------------------------
+# Inputs. Paths are relative to the repository root. data/raw and data/frozen
+# are inputs and are never written to.
+# -----------------------------------------------------------------------------
+paths:
+  raw:
+    # The raw transaction and registry records, as supplied with the submission.
+    itbi_csv:          data/raw/itbi_transactions.csv
+    registry_csv:      data/raw/unit_registry.csv
+    # The same ITBI records as `itbi_csv`, plus a `Purpose_EN` translation
+    # column. It is read for that column alone, to label the purpose -> category
+    # mapping table (`prep.purpose_mapping`); the categories themselves come
+    # from `profiling.purpose.rules`, never from the translation.
+    itbi_xlsx:         data/raw/itbi_transactions_purpose_en.xlsx
+  frozen:
+    # The two layers of the submitted analysis: one row per address (9,030
+    # points) and the 500 m hexagon grid (821 cells), each carrying the five
+    # centralities and the submitted `Preco` / `Puni` columns.
+    cents_disaggregated: data/frozen/cents_disaggregated.gpkg
+    cents_aggregated:    data/frozen/cents_aggregated.gpkg
+    # The segment-level centralities (`edges_combined.shp`, 65,357 segments),
+    # the file the 500 m columns were aggregated from. A directory, because a
+    # shapefile is several files.
+    segment_edges_dir:   data/frozen/segments
+    # The base network and capacities the preferential-centrality solver runs
+    # on, the two scripts that build a routing graph from a shapefile and
+    # rebuild the static weight R, and the verification run `paper_run.npz`.
+    # Referenced again as `inputs.pc_solver.reconstruction_bundle`.
+    network_dir:         data/frozen/network
+    # The official IBGE municipal mesh (Malha Municipal Digital 2025): the 499
+    # municipalities of Rio Grande do Sul in EPSG:4674 (SIRGAS 2000
+    # geographic); Porto Alegre is CD_MUN 4314902. IBGE's own terms apply --
+    # see data/README.md.
+    municipal_boundary_dir: data/frozen/boundary
+  interim: data/interim
+  outputs: outputs
+  reports: reports
+  env:     env
+  logs:    logs
+
+io:
+  csv_sep: ";"
+  # Tried in this order. latin-1 is last on purpose: it decodes any byte
+  # sequence, so a probe that tried it first would "succeed" on files it
+  # silently mangles.
+  csv_encoding_candidates: ["utf-8", "cp850", "cp437", "cp1252", "latin-1"]
+  # As detected by src/00_inventory.py. The two files differ.
+  csv_encoding_detected:
+    itbi_csv: "ascii"       # pure ASCII: accents already stripped
+    registry_csv: "cp850"   # DOS Latin-1: 0x80 = C-cedilla, 0x90 = E-acute
+  # The registry also contains literal '?' characters where accented letters
+  # were lost before export (unrecoverable). Some fall in `Street`, i.e. in the
+  # join key, so address normalisation folds accents and treats '?' as a
+  # single-character wildcard (`profiling.address.question_mark`); otherwise
+  # those rows would fail to join.
+  missing_codes: ["INDETERMINADO", "", "NA"]
+
+# -----------------------------------------------------------------------------
+# Centrality columns. The five measures are taken from the frozen layers and
+# are never recomputed for the headline analysis.
+#   disaggregated: point layer, one row per address
+#   aggregated:    500 m hexagon grid (layer name: Grade_POA_complete_3)
+# Aggregation rule (paper Sec. 4.5): accessibility -> mean, intermediation -> sum.
+# PC1 is preferential centrality with agglomeration (gamma = 1); PC2 is
+# preferential centrality without agglomeration (gamma = 0).
+# -----------------------------------------------------------------------------
+measures:
+  accessibility: [PC1, PC2, CC]
+  intermediation: [BC, FK]
+  columns:
+    disaggregated:
+      PC1: PC1
+      PC2: PC2
+      CC:  CC
+      BC:  BC
+      FK:  FK
+      land_value: Puni          # = Preco / Terreno (holds on 9,026 of 9,030 rows)
+      total_price: Preco        # already includes the unit multiplier
+      plot_area: Terreno
+      built_area: Area_Const
+      address_key: Endereco
+      property_type: Type
+    aggregated:
+      PC1: cd1g1b2k0_mean
+      PC2: cd4g0b2k0_mean
+      CC:  GgAcc0_mean
+      BC:  GgBtw0_sum
+      FK:  GgCen0_sum
+      land_value: Puni_mean
+      plot_area: Terreno_mean
+    # --- MAUP layers ---------------------------------------------------------
+    # Stage 2 writes the 250 m and 1,000 m grids with logical column names
+    # (`aggregate_segment_centralities()` names its output after the measure),
+    # while the rebuilt 500 m layer keeps the submitted layer's names so it
+    # lines up with `aggregated` above. The suffix encodes the aggregation rule
+    # (`grid.aggregation`): accessibility -> _mean, intermediation -> _sum.
+    maup_250m:
+      PC1: PC1_mean
+      PC2: PC2_mean
+      CC:  CC_mean
+      BC:  BC_sum
+      FK:  FK_sum
+      land_value: Puni_mean        # rebuilt by stage 1, not the frozen column
+      plot_area: Terreno_mean
+    maup_500m_rebuilt:             # stage-2 rebuild of the frozen 500 m layer:
+      PC1: cd1g1b2k0_mean          # centralities carried across unchanged,
+      PC2: cd4g0b2k0_mean          # land value rebuilt by stage 1
+      CC:  GgAcc0_mean
+      BC:  GgBtw0_sum
+      FK:  GgCen0_sum
+      land_value: Puni_mean        # rebuilt; `Puni_mean_frozen` is the submitted one
+      plot_area: Terreno_mean
+    maup_1000m:
+      PC1: PC1_mean
+      PC2: PC2_mean
+      CC:  CC_mean
+      BC:  BC_sum
+      FK:  FK_sum
+      land_value: Puni_mean
+      plot_area: Terreno_mean
+  # Preferential-centrality parameter variants. Column names follow the
+  # authors' batch driver:
+  #   cd{run}g{gamma}b{beta}k{int(100*Dp)}   cd = density = ca / area
+  # `run` restarts at 1 in each batch, and Dp < 0.01 truncates to k0. The
+  # driver drops decimal points, so a name alone is ambiguous (`b15` is
+  # beta = 1.5, `b225` is 2.25, `g05` is gamma = 0.5); this table, not the name,
+  # is the authority on a column's parameters, and `declared_parameters()`
+  # resolves through it before falling back to parsing the name.
+  pc_variant_parameters:          # column stem -> batch, run, gamma, beta, Dp
+    cd1g1b2k0:  {batch: 2, run: 1, gamma: 1, beta: 2, dp: 0}       # submitted PC1
+    cd2g1b2k0:  {batch: 2, run: 2, gamma: 1, beta: 2, dp: 0.0001}
+    cd3g1b2k0:  {batch: 2, run: 3, gamma: 1, beta: 2, dp: 0.001}
+    cd4g1b2k0:  {batch: 2, run: 4, gamma: 1, beta: 2, dp: 0.005}
+    cd1g1b2k1:  {batch: 1, run: 1, gamma: 1, beta: 2, dp: 0.01}
+    cd2g1b2k3:  {batch: 1, run: 2, gamma: 1, beta: 2, dp: 0.03}
+    cd3g1b2k10: {batch: 1, run: 3, gamma: 1, beta: 2, dp: 0.10}
+    cd4g0b2k0:  {batch: 1, run: 4, gamma: 0, beta: 2, dp: 0}       # submitted PC2
+    # --- the beta and gamma variants of the revision (src/11_pc_runs.py) -----
+    # Run indices 101-110 lie outside every index the authors' batches used,
+    # so no variant name can collide with a submitted column.
+    cd101g1b15k0: {batch: poa_repro_2026_08_26, run: 101, gamma: 1, beta: 1.5, dp: 0}
+    cd102g0b15k0: {batch: poa_repro_2026_08_26, run: 102, gamma: 0, beta: 1.5, dp: 0}
+    cd103g1b25k0: {batch: poa_repro_2026_08_26, run: 103, gamma: 1, beta: 2.5, dp: 0}
+    cd104g0b25k0: {batch: poa_repro_2026_08_26, run: 104, gamma: 0, beta: 2.5, dp: 0}
+    cd105g05b15k0:  {batch: poa_repro_2026_08_30, run: 105, gamma: 0.5, beta: 1.5,  dp: 0}
+    cd106g05b2k0:   {batch: poa_repro_2026_08_30, run: 106, gamma: 0.5, beta: 2.0,  dp: 0}
+    cd107g05b25k0:  {batch: poa_repro_2026_08_30, run: 107, gamma: 0.5, beta: 2.5,  dp: 0}
+    cd108g1b225k0:  {batch: poa_repro_2026_08_30, run: 108, gamma: 1,   beta: 2.25, dp: 0}
+    cd109g05b225k0: {batch: poa_repro_2026_08_30, run: 109, gamma: 0.5, beta: 2.25, dp: 0}
+    cd110g0b225k0:  {batch: poa_repro_2026_08_30, run: 110, gamma: 0,   beta: 2.25, dp: 0}
+  # The density-penalty (Dp) family as it sits in the frozen aggregated layer.
+  # src/40_revision.R reports these columns descriptively; the revision runs no
+  # new Dp variants.
+  pc_variants_aggregated:
+    k0:  cd1g1b2k0_mean       # submitted PC1 (gamma = 1, beta = 2)
+    k1:  cd1g1b2k1_mean
+    k3:  cd2g1b2k3_mean
+    k10: cd3g1b2k10_mean
+
+# -----------------------------------------------------------------------------
+# Additional inputs: the segment network, the solver of record and GAUS.
+# -----------------------------------------------------------------------------
+inputs:
+  # Segment-level centralities: the table the frozen 500 m columns were
+  # aggregated from. For every centrality column pair, frozen `*_sum / *_mean`
+  # is an integer in every cell and all pairs agree on it -- 29,871 segment-cell
+  # memberships in total -- and every frozen 500 m column is reproduced from
+  # this file under the `intersects` rule below.
+  segment_centralities:
+    path: data/frozen/segments/edges_combined.shp
+    layer: edges_combined
+    # The file declares EPSG:32722 (WGS 84 / UTM 22S) and the frozen layers
+    # EPSG:31982 (SIRGAS 2000 / UTM 22S). The difference is the datum only; the
+    # loader transforms explicitly and the shift here is below 1e-4 m.
+    source_crs_epsg: 32722
+    # Logical measure -> column name, identified by reproducing every frozen
+    # `*_mean` / `*_sum` column from the segments. There is no id column;
+    # (node1, node2) is unique over all 65,357 rows and serves as the key.
+    columns:
+      segment_id: [node1, node2]
+      PC1: cd1g1b2k0
+      PC2: cd4g0b2k0
+      CC: GgAcc0
+      BC: GgBtw0
+      FK: GgCen0
+    # How a segment is assigned to a cell. Under `intersects` a segment belongs
+    # to every cell its geometry touches; this gives 29,871 segment-cell pairs
+    # and matches the per-cell count in all 821 cells. The one-cell-per-segment
+    # rules undershoot by about 19 % in every cell.
+    assignment_rule: intersects   # intersects | midpoint | centroid |
+                                  # representative_point | length_majority
+    representative_point: midpoint      # read only when assignment_rule is a
+                                        # point rule
+    # Aggregation follows grid.aggregation: accessibility -> mean,
+    # intermediation -> sum.
+    expected_features: 65357          # rows in the shapefile
+
+  # ---------------------------------------------------------------------------
+  # The base network of the submitted preferential-centrality run.
+  # `edges_combined.shp` was written from the model's own segment graph, so it
+  # is the submitted network; this GeoPackage is that network and its
+  # capacities with every result column removed, so it cannot be scored
+  # against its own output. It is the input every new PC run is computed from.
+  # ---------------------------------------------------------------------------
+  base_network:
+    path: data/frozen/network/poa_base_network.gpkg
+    layer: segments
+    source_crs_epsg: 32722
+    # Provenance: extracted from `segment_centralities.path`; that file's
+    # sha256 is recorded here and in `poa_base_network_manifest.json`.
+    derived_from: data/frozen/segments/edges_combined.shp
+    derived_from_sha256: 8443a2aa542575005dd0c146c410c57073b9871ce45babba00f88e5cb8fcc4a8
+    columns:
+      segment_id: [node1, node2]   # unique over all rows
+      length_m: dist               # segment length, metres
+      speed_kmh: speed             # km/h; cost = dist / (speed/60)
+      static_weight: area          # R = buildable area in a 30 m buffer;
+                                   # area == 0: the segment carries routes but
+                                   # is not a zone
+    counts:
+      segments: 65357
+      zones: 56162                 # area > 0
+      zero_capacity_segments: 9195 # area == 0; PC = 0 is written for them
+      sum_R: 243801729.95161343
+
+  # ---------------------------------------------------------------------------
+  # The solver of record for every new preferential-centrality run: `prefcent`
+  # 0.1.0 (Hellervik 2026). Run on the base network above with the parameters
+  # in `submitted_run`, it reproduces the submitted PC1/PC2 columns on all
+  # 65,357 segments to about 1e-14 relative. The parameters are the model
+  # definition of the submitted run, not defaults; changing any of them gives a
+  # variant.
+  # ---------------------------------------------------------------------------
+  pc_solver:
+    package: prefcent
+    version: "0.1.0"
+    # The PyPI wheel of the public release (PyPI prefcent==0.1.0, identical to
+    # tag v0.1.0 of github.com/prefcent/prefcent). With it, `make pc-runs
+    # ARGS="--only b2"` followed by `make pc-accept` reproduces the submitted
+    # PC1/PC2 on all 65,357 segments.
+    wheel: env/wheels/prefcent-0.1.0-py3-none-any.whl
+    wheel_sha256: 5eac754208c9158a27b86c1cd38286107e94405cf2b18024d3ae986dd69efa35
+    upstream: https://github.com/prefcent/prefcent
+    upstream_commit: b99188278edfb90c854375b6da31b2a3d13f5ae7
+    upstream_tag: v0.1.0
+    pypi: prefcent==0.1.0
+    doi: 10.5281/zenodo.22643614    # Zenodo deposit of v0.1.0 (Hellervik 2026)
+    # Install: `pip install prefcent==0.1.0`, or offline:
+    #   pip install --no-deps env/wheels/prefcent-0.1.0-py3-none-any.whl
+    reconstruction_bundle: data/frozen/network
+    recipe: data/frozen/network/README.md
+    driver: data/frozen/network/reconstruct_paper_run.py
+    # --- the submitted run's parameters -------------------------------------
+    submitted_run:
+      gamma: [1, 0]              # PC1 = 1 (with agglomeration); PC2 = 0 (without)
+      beta: 2.0                  # f(c) = (c + d0)^(-beta)
+      d0: 5000.0                 # metre-equivalents: a 5-minute start-and-end
+                                 # penalty (1000 = one minute)
+      kappa: 0                   # no density penalty (Dp = 0)
+      a0: R                      # initial state = the static weights
+      omega: 1.0                 # direct substitution, no damping
+      normalization: l1_2024     # L1 renormalisation to sum(R) at each step
+      max_iter: 200              # exactly 200 iterations with no tolerance: the
+      stop: budget_only          # submitted run stopped at this budget, and a
+                                 # reproduction must stop there too (PC1 is
+                                 # near, not at, its fixed point)
+      self_interaction: false    # zero diagonal; c_ii would otherwise give d0^-beta
+    # --- how the routing graph is built from `base_network` -----------------
+    graph:
+      rule: split_every_segment_at_its_midpoint
+      zone_position: midpoint     # a zone sits at the midpoint of its segment
+      connector_cost: 0.0         # the zone-to-road connector has dist exactly 0
+      cost: dist / (speed / 60)   # metre-equivalents at 60 km/h
+      cost_units: "metre-equivalents at 60 km/h (1000 per minute)"
+      speed_reference_kmh: 60.0
+      duplicate_edge_rule: minimum  # 53 self-loop segments (node1 == node2, 47
+                                    # of them zones) contribute two identical
+                                    # half-edges; they are resolved by the
+                                    # minimum, since summing would double the
+                                    # access cost of those 47 zones
+      zero_capacity_segments_carry_routes: true
+      graph_nodes: 111030
+      graph_edges: 130714
+    # What a run costs: the dense 56,162 x 56,162 float64 kernel is 23.5 GiB,
+    # plus working copies (peak 53.5 GiB in the runs of record); 32 GiB of RAM
+    # is the minimum.
+
+  # ---------------------------------------------------------------------------
+  # GAUS Lines v1.1, run headlessly (src/13_gaus_headless.py).
+  #
+  # CC, BC and FK are produced by the QGIS plugin GAUS Lines v1.1 (Dalcin and
+  # Krafta 2021) itself, run under QGIS 3.34 through `qgis_process`, for the
+  # reference network and for every boundary variant.
+  #
+  # The plugin is not redistributed here: its upstream repository carries no
+  # licence file. `make gaus-fetch` clones it into `tools/GAUS/` (ignored by
+  # git) at `upstream_commit`, and `script_source` points there.
+  #
+  # Two Python interpreters are involved. `qgis.core` lives in the system
+  # Python; the analysis environment has geopandas and no qgis. The driver runs
+  # in the analysis environment and calls `qgis_process` with that
+  # environment removed from the child's PATH (`path_for_qgis`): qgis_process
+  # embeds a Python whose sys.prefix follows PATH, and with a virtualenv first
+  # on PATH it cannot import qgis, disables Python support and no longer finds
+  # any script algorithm. The three paths below are those of a Debian/Ubuntu
+  # QGIS package; adjust them for another installation.
+  # ---------------------------------------------------------------------------
+  gaus_headless:
+    # Default input: the segment file of record. Named again rather than
+    # cross-referenced because the driver is also pointed at boundary variants.
+    input: data/frozen/segments/edges_combined.shp
+    layer: edges_combined
+    # The layer is measured in its own CRS and never reprojected: transforming
+    # EPSG:32722 -> EPSG:31982 moves coordinates by < 1e-4 m, about 2e-6
+    # relative on a 79 m segment, which is far outside the 1e-9 acceptance band.
+    # The plugin is a Processing script decorated with @alg: it cannot be
+    # imported, only registered. `qgis_process` is the supported headless entry
+    # point and streams the plugin's own progress lines to the log.
+    qgis_process: /usr/bin/qgis_process
+    algorithm_id: script:GAUS_l11
+    # Registration = copying the script into the QGIS profile's
+    # processing/scripts directory. The driver copies it on every run and
+    # records the SHA-256 of the file it ran in the run manifest
+    # (`data/interim/gaus_headless_<label>_manifest.json`).
+    script_source: tools/GAUS/v1.1/GAUS Lines v1.1.py
+    upstream: https://github.com/gkdalcin/GAUS
+    upstream_ref: main
+    # `GAUS Lines v1.1.py` is byte-identical at every upstream commit from
+    # 38a76b7 (2021-07-09) to this one. `make gaus-fetch` checks the fetched
+    # file against `script_sha256` (read by the Makefile).
+    upstream_commit: 488739cecfc8ccf96a379d985af18e0ba7811344
+    script_sha256: d72f8e529521e16543efb6056512a5feb8e4ae542e496cb8abba2964a476bb74
+    local_clone: tools/GAUS
+    profile_scripts_dir: ~/.local/share/QGIS/QGIS3/profiles/default/processing/scripts
+    script_installed_name: GAUS_Lines_v1_1.py
+    # Child-process environment: no display, and no virtualenv on PATH.
+    qt_qpa_platform: offscreen
+    path_for_qgis: /usr/bin:/bin
+    # The algorithm writes its result columns into its input layer
+    # (`dataProvider().addAttributes`). The driver therefore copies the layer
+    # here first, as an ESRI Shapefile in the layer's own CRS, keeping only the
+    # id columns plus a `gaus_rid` row-order check. With no `Gg*`/`Tg*` column
+    # present the plugin's name counter starts at 0, so the outputs come back
+    # as GgAcc0/GgBtw0/GgCen0/GgCnc0.
+    work_dir: data/interim/gaus_headless_work
+    # The submitted run, in the plugin's own enum coding:
+    parameters:
+      analysis: 1              # [Topological, Geodetic] -> Geodetic
+      metrics: [0, 1, 2, 7]    # Accessibility, Betweenness, Freeman-Krafta, Connectivity
+      geomrule: 0              # Overlapping Vertices (GEOS `touches`)
+      radius: 0.0              # global analysis
+      impedance: null          # no field selected -> imp = 1
+      load: null               # no field selected -> load = 1
+      supply: null
+      demand: null
+      dest: null               # results go into the input copy, no second file
+    expected_columns: [GgAcc0, GgBtw0, GgCen0, GgCnc0]
+    id_columns: [node1, node2] # key of record; row order is the fallback
+    # GAUS is single-process pure Python and takes no worker count, so
+    # `compute.max_workers` does not apply. null = no timeout.
+    timeout_seconds: null
+
+# -----------------------------------------------------------------------------
+# Acceptance test for a new preferential-centrality run
+# (src/06_pc_acceptance.py):
+#   make pc-accept FILE=<candidate>
+# A run is compared with the file of record segment by segment (tier 1, which
+# decides the verdict), on the 500 m cells (tier 2) and on the address points
+# (tier 3). A file is listed in `revision.pc_sensitivity.input_files` or
+# `revision.boundary_sensitivity.input_files` only after it has been through
+# this test. A candidate must carry (node1, node2) or a geometry the matching
+# keys below can use, and the PC columns named in `columns` (or passed with
+# --pc1-col / --pc2-col).
+# -----------------------------------------------------------------------------
+pc_acceptance:
+  # The reference is `inputs.segment_centralities` (the file of record).
+  #
+  # Default candidate column map: the names of the two submitted runs.
+  columns:
+    PC1: cd1g1b2k0        # gamma 1, beta 2, Dp 0
+    PC2: cd4g0b2k0        # gamma 0, beta 2, Dp 0
+  # Compared alongside the PC columns when present on both sides. The `ca*`
+  # mass columns are found from the PC column names (cd -> ca).
+  extra_columns: [area, weight]
+  id_cols: [node1, node2]
+  # Segment identity, best key first. The first key that matches any segment
+  # is used and reported; a key value that repeats is dropped on both sides
+  # rather than matched arbitrarily.
+  key_priority: [id_cols, geometry_wkb, rounded_coords, nearest_centroid, row_order]
+  coord_round_m: 0.001          # rounded-coordinate key, 1 mm: two exports of
+                                # one network agree far inside this, and two
+                                # different networks do not collide at it
+  nearest_centroid_tol_m: 1.0   # last-resort geometric match; 1 m is about
+                                # 1/40 of the median segment length (44 m), so
+                                # it cannot pair a segment with its neighbour
+  tier1:                        # segment level -- decides the verdict
+    exact_rel_tol: 1.0e-9       # float round-trip, as grid.validation.exact_rel_tol
+    tight_rel_tol: 0.001        # 0.1 %: well above the ~1e-7 storage rounding
+                                # of the frozen files, far below any real
+                                # parameter change
+    within_rel_tol: 0.01        # the 1 % band, as grid.validation
+    pass_share_tight: 0.999     # PASS: >= 99.9 % of common segments within 0.1 %.
+                                # The reference scored against itself gives
+                                # 100 %; less than 99.9 % is a systematic
+                                # difference, not noise.
+    warn_share_within: 0.99     # PASS WITH WARNING: >= 99 % within 1 %
+  tier2:                        # hexagon level -- reported, does not decide
+    grid_source: regenerated    # regenerated | frozen. `regenerated` exercises
+                                # build_grid(), which reproduces the 821 frozen
+                                # cells to 6e-11 m.
+    within_rel_tol: 0.01
+    pass_share: 0.99            # as grid.validation.hypothesis_a_within_share
+    full_coverage_only: true    # a partial network is scored only on cells
+                                # where the candidate has the same number of
+                                # segments as the reference under `intersects`
+    worst_cells_listed: 10
+  tier3:                        # point level -- reported, does not decide
+    within_rel_tol: 0.01
+    pass_share: 0.99
+    # On a partial network a point outside the extent snaps to whatever segment
+    # is nearest the boundary, which says something about the clip, not about
+    # the solver. Only points whose nearest reference segment is present count.
+    restrict_to_covered_points: true
+    allow_junction_ties: true   # an address whose perpendicular foot lands on
+                                # a shared node is equidistant from two
+                                # segments, and the submitted join's tie-break
+                                # is not observable; either segment is accepted
+  # Density-penalty (Dp) variants are outside the scope of the revision. The
+  # test reports whether a Dp != 0 column is present and whether the candidate
+  # column's name announces the submitted (gamma, beta, Dp); it makes no
+  # further Dp comparison.
+  report_dp_columns: true
+
+# -----------------------------------------------------------------------------
+# Acceptance test for a GAUS Lines run (src/08_gaus_acceptance.py):
+#   make gaus-accept FILE=<candidate>
+# Same three tiers, segment matching and partial-network handling as
+# `pc_acceptance` (shared code). Only the thresholds and the measure map
+# differ; see `tier1` for why.
+# -----------------------------------------------------------------------------
+gaus_acceptance:
+  # Logical measure -> column in the file of record. The names follow the
+  # plugin's own pattern [G][g][metric][run]. `GgCnc0` is connectivity, which
+  # the paper does not use but which is the cheapest check of the adjacency
+  # rule, so it is scored.
+  columns:
+    CC:  GgAcc0
+    BC:  GgBtw0
+    FK:  GgCen0
+    CNC: GgCnc0
+  # Measures that decide the verdict. CNC decides too: if the adjacency rule is
+  # wrong every other column is wrong for that reason, and the report should
+  # show the one cause rather than three failures.
+  verdict_measures: [CC, BC, FK, CNC]
+  id_cols: [node1, node2]
+  key_priority: [id_cols, geometry_wkb, rounded_coords, nearest_centroid, row_order]
+  coord_round_m: 0.001
+  nearest_centroid_tol_m: 1.0
+  tier1:                        # segment level -- decides the verdict
+    exact_rel_tol: 1.0e-9
+    tight_rel_tol: 1.0e-9       # much tighter than the PC test's 0.1 %. GAUS is
+                                # deterministic double arithmetic over integer
+                                # path counts, and the frozen BC and FK
+                                # aggregates reproduce from the segment file at
+                                # 1e-14..1e-10 (CC to ~1e-8, which is storage
+                                # rounding in the frozen layer). A run that
+                                # agrees only to 0.1 % has a logic difference --
+                                # another adjacency rule, tie-break or halving --
+                                # that a looser band would hide. The legitimate
+                                # sources of disagreement are the reassociation
+                                # of ~65k float additions (~1e-14) and the DBF's
+                                # 15-decimal storage (~1e-16).
+    within_rel_tol: 0.001       # 0.1 %: the PASS WITH WARNING band
+    pass_share_tight: 0.9999    # PASS: >= 99.99 % of common segments within
+                                # 1e-9, which leaves room for about 6 segments
+                                # on a float knife-edge but not for a
+                                # systematic difference
+    warn_share_within: 0.999    # PASS WITH WARNING: >= 99.9 % within 0.1 %.
+                                # Below that the result is FAIL and the report
+                                # names the metric and the worst segments.
+    worst_segments_listed: 10
+  tier2:                        # hexagon level -- reported, does not decide
+    grid_source: regenerated
+    within_rel_tol: 0.01
+    pass_share: 0.99
+    full_coverage_only: true
+    worst_cells_listed: 10
+  tier3:                        # point level -- reported, does not decide
+    within_rel_tol: 0.01
+    pass_share: 0.99
+    restrict_to_covered_points: true
+    allow_junction_ties: true
+
+
+# -----------------------------------------------------------------------------
+# The hexagon grid.
+#
+# These parameters regenerate all 821 cells of the frozen 500 m layer with a
+# maximum centroid offset of ~1e-10 m and a maximum Hausdorff distance of
+# ~1e-9 m on the 777 unclipped cells.
+#
+# Lattice: flat-top hexagons (two horizontal edges; vertices due east and west).
+#   centre_x(col)      = origin_x + col * spacing * sqrt(3)/2
+#   centre_y(row, col) = origin_y - row * spacing - (col mod 2) * spacing/2
+# so `row_index` increases southward and odd columns sit half a row lower.
+# Each of a cell's six neighbours is exactly `spacing_m` away.
+# -----------------------------------------------------------------------------
+grid:
+  crs_epsg: 31982              # SIRGAS 2000 / UTM 22S, as both frozen layers
+  orientation: flat_top        # flat_top | pointy_top
+  spacing_m: 500.0             # centre-to-centre = across-flats height
+  # Centre of cell (row_index = 0, col_index = 0). Shared by every cell size.
+  origin_x: 469678.23673459486
+  origin_y: 6689390.3004
+
+  # Which coordinate pair of the frozen point layer positions an address.
+  # `address` is the georeferenced plot point; `snapped` is its projection onto
+  # the street network (the layer's own nearest_x/nearest_y). `address`
+  # reproduces the frozen Puni_mean.
+  point_positions:
+    address: [feature_x, feature_y]
+    snapped: [nearest_x, nearest_y]
+  active_point_position: address
+
+  # Paper Sec. 4.5. Applied by logical role, so a new measure only has to be
+  # listed under `measures.accessibility` or `measures.intermediation`.
+  aggregation:
+    accessibility: mean        # PC1, PC2, CC
+    intermediation: sum        # BC, FK
+    land_value: mean
+    plot_area: mean
+
+  frozen_500m:
+    path_ref: paths.frozen.cents_aggregated
+    layer: Grade_POA_complete_3   # the GeoPackage's only layer
+    id_column: id
+    row_column: row_index
+    col_column: col_index
+    area_column: Area          # ellipsoidal area (WGS84), not the planar one
+    n_cells: 821
+    n_full_cells: 777          # the rest are clipped to the municipal boundary
+    n_clipped_cells: 44
+    planar_cell_area_m2: 216506.35094611
+    planar_cell_area_ha: 21.6506
+    ellipsoidal_cell_area_ha: 21.6677   # the paper's "21.67 hectares"
+
+  # MAUP: the 250 m and 1,000 m grids share the origin, orientation and CRS of
+  # the 500 m grid and cover the same study area.
+  maup:
+    sizes_m: [250, 1000]
+    # The study area is the union of the 821 frozen cells, so all three grids
+    # cover exactly one region.
+    study_area: frozen_500m_union       # frozen_500m_union | <path to a polygon>
+
+  # Clipping a regenerated lattice against a polygon that was itself built by
+  # unioning polygons leaves floating-point slivers (~1e-8 m^2). Anything below
+  # this area is not a cell. The smallest genuine frozen cell is 44,699 m^2
+  # (20.6 % of a whole hexagon), so the threshold cannot discard real data.
+  min_cell_area_m2: 1.0
+
+  validation:
+    exact_rel_tol: 1.0e-9      # float round-trip: "reproduces exactly"
+    within_rel_tol: 0.01       # the 1 % band
+    geometry_tol_m: 0.001
+    # A frozen column counts as reproduced from the points if at least this
+    # share of cells is within `within_rel_tol`.
+    hypothesis_a_within_share: 0.99
+
+# -----------------------------------------------------------------------------
+# Dependent variable
+# -----------------------------------------------------------------------------
+dependent_variable:
+  # Puni = total value of all units on the plot / plot area.
+  # The frozen point layer carries the submitted `Preco` / `Puni` columns.
+  # Stage 1 (src/10_dependent_variable.py) rebuilds the variable from the raw
+  # records under the conventions below and scores the rebuild against the
+  # frozen column address by address.
+  #
+  # `source` is what the validation gate uses: the frozen column, so that the
+  # gate reproduces the submitted figures from the submitted data.
+  source: frozen             # frozen | rebuilt
+  # `proposed_source` is what the revised manuscript's tables use: the column
+  # rebuilt from the raw records by stage 1, so that every revised number is
+  # reproducible from the supplied CSVs. It is read by the W-choice sweep and
+  # block CV (src/40_w_choice.R), the PC parameter sensitivity (src/41), the
+  # sample sensitivity (src/47), the controls and type split (src/49) and
+  # Table 5's LM rows (src/52); src/48_rebuilt_dv.R runs both sources side by
+  # side.
+  proposed_source: rebuilt          # frozen | rebuilt
+  formula: total_price_over_plot_area
+  # Name of the variable in the revised manuscript. "Land value" is used only
+  # for the vacant-plot subsample, where it is accurate.
+  manuscript_name: "improved-property value per m² of land"
+
+  # --- conventions of the stage-1 rebuild. Where the raw records allow more
+  # than one reading, the option chosen is the one under which the rebuild
+  # reproduces the frozen `Preco` column best (profiled by src/00_profile.py).
+  itbi_duplicates: dedupe             # dedupe | keep_as_repeat_sales
+                                      # (moves the match by <= 0.4 pp either way)
+  blank_purpose: keep_as_nonparking   # keep_as_nonparking | drop | both_bounds
+  parent_rows_in_multiplier: include  # include | exclude
+  plot_area_source: geolayer          # geolayer | registry | itbi
+  # Also fixed by the rebuild: the 7 "imovel especial" records are kept (they
+  # are inside N = 7,767), plot area is not capped, the low-confidence rows of
+  # the purpose mapping are used as mapped, and repeated address records in
+  # the frozen layer are kept and reported.
+  purpose_mapping: outputs/tables/stage0b_purpose_mapping.csv
+  # Headline construction, recovered from the frozen column (89.3 % exact):
+  price_statistic: mean               # mean | median
+  price_transactions: non_parking     # all | non_parking
+  multiplier_units: non_parking       # all | non_parking | non_parking_non_parent
+  # 6 of the 9,030 frozen records are addresses whose ITBI transactions are all
+  # parking. The frozen column still carries a price for them, which can only
+  # have come from the parking sales, so the submitted construction used the
+  # full transaction set when the non-parking subset was empty rather than
+  # dropping the address. All 6 are inside the submitted N = 7,767.
+  only_parking_fallback: use_all_transactions  # use_all_transactions | leave_undefined
+  # A registry "parent" row is an address-level row with a blank `Unity`;
+  # `parent_rows_in_multiplier: include` counts them. Some addresses have only
+  # parent rows -- two or three, and no numbered unit -- and there the frozen
+  # column is the sale price times one, not times the number of parent rows
+  # (e.g. Av. Alcides S. Severiano 10: 3 parent rows, frozen Preco = 530,000 =
+  # the single sale). `one` collapses the multiplier at exactly those addresses.
+  # On the whole layer this moves the exact match from 89.38 % to 89.42 % and
+  # the within-1 % match from 95.19 % to 95.24 %, rescuing 4 records and
+  # breaking none (`outputs/tables/stage1_rule_refinement.csv`).
+  parent_only_address_counts_as: one   # one | n_parents
+  # Patterns tested alongside that refinement as diagnostics only and not
+  # adopted, because they are worse on the full layer. Kept here so the
+  # numbers in the stage-1 report are reproducible.
+  refinement_diagnostics:
+    parking_in_price_max_sales: 2   # re-admit parking to the price mean at
+                                    # addresses with at most this many sales
+  # Byte-identical registry rows (29,634, 3.5 %) inflate the unit multiplier
+  # directly; deduplicating them improves both the exact and the within-1 %
+  # reproduction of the frozen column.
+  registry_duplicates: dedupe         # dedupe | keep
+
+  # --- stage-1 outputs, consumed by stage 2 and the revision analyses ------
+  rebuilt_path: data/interim/dependent_variable_headline.csv
+  # The rebuild is made for the frozen point layer's records, because the
+  # centralities and the plot area are attached to them and the submitted
+  # exclusion funnel is defined on them. The georeferencing that selected those
+  # 9,030 records from the 11,123 ITBI addresses cannot be reproduced from the
+  # raw files.
+  # Scoring the rebuild against the frozen column, address by address.
+  validation:
+    exact_rtol: 1.0e-6                # np.isclose rtol for "exact"
+    within_rel_tol: 0.01              # the 'within 1 %' band
+    rounding_tol_abs: 0.5             # |rebuilt - frozen| <= this => rounding only
+    implied_units_tol: 0.01           # frozen/price is this close to an integer
+    # Residual audit: for an address with at most this many transactions, every
+    # subset of them is tried, to see whether the frozen value is the formula
+    # over a strict subset of the sales. Brute force, hence the cap.
+    residual_subset_probe_max_tx: 10
+  # Variants written to data/interim/. `headline` must equal the three keys
+  # above; stage 1 stops if they differ. The two alternates are the parking
+  # conventions of `revision.parking.alternates`; src/47_sample_sensitivity.R
+  # runs them at the address level, and src/45_maup.R on the cells.
+  variants:
+    headline:
+      price_transactions: non_parking
+      multiplier_units: non_parking
+      price_statistic: mean
+    parking_in_multiplier_only:
+      price_transactions: non_parking
+      multiplier_units: all
+      price_statistic: mean
+    parking_in_both:
+      price_transactions: all
+      multiplier_units: all
+      price_statistic: mean
+
+# -----------------------------------------------------------------------------
+# Exclusions. The order is part of the specification: at the address level,
+# positivity before the IQR filter reproduces the submitted N = 7,767; the
+# reverse order gives 7,714.
+# -----------------------------------------------------------------------------
+exclusions:
+  # The order is set per level. The cell level applies no outlier removal: the
+  # submitted cell-level analysis has none, and positivity alone reproduces its
+  # correlations (PC1 r = 0.5427 against the reported 0.54), whereas the IQR
+  # filter would drop N to 753.
+  order:
+    disaggregated: [positivity, iqr_outliers]
+    aggregated:    [positivity]
+    # The MAUP levels are the cell level at other cell sizes: positivity only,
+    # one key per size so the count log names the grid a filter ran on.
+    maup_250m:     [positivity]
+    maup_500m:     [positivity]
+    maup_1000m:    [positivity]
+  positivity:
+    disaggregated: [Preco, Puni, PC1, PC2, CC, BC, FK, Terreno]
+    aggregated:    [land_value, PC1, PC2, CC, BC, FK, plot_area]
+    # src/45_maup.R renames each source layer's columns to the logical names
+    # (via measures.columns.maup_*) before filtering, so the list is the
+    # logical one at every size and all five measures share one sample, which
+    # keeps the CV ranking comparable.
+    maup_250m:     [land_value, PC1, PC2, CC, BC, FK, plot_area]
+    maup_500m:     [land_value, PC1, PC2, CC, BC, FK, plot_area]
+    maup_1000m:    [land_value, PC1, PC2, CC, BC, FK, plot_area]
+  iqr_outliers:
+    variable: land_value
+    multiplier: 1.5            # the fence is computed on the rows that reach
+                               # this step, i.e. after positivity
+  # The submitted point-level funnel as printed in the manuscript: ITBI rows,
+  # geolayer records, records after positivity, analysis sample.
+  targets:
+    itbi_rows: 36578
+    disaggregated_records: 9033
+    disaggregated_after_positivity: 8167
+    disaggregated_n: 7767
+    aggregated_n: 812        # analysis N after positivity; 821 = full grid
+    aggregated_grid_n: 821
+
+# -----------------------------------------------------------------------------
+# Transforms
+# -----------------------------------------------------------------------------
+transforms:
+  log_variables: [land_value, PC1, PC2, CC, BC, FK, plot_area]
+  zero_handling: exclude       # exclude | log_plus_c   (submitted: exclude)
+  log_plus_c: 1.0
+
+# -----------------------------------------------------------------------------
+# Spatial weights
+#
+# Every weight matrix is a named spec below, built by `build_weights()` in
+# src/common.R: kNN specs via knearneigh -> knn2nb -> nb2listw, distance bands
+# via dnearneigh, all on EPSG:31982 coordinates, all row-standardised
+# (style "W") in both the LM tests and the models.
+#
+# The paper text states kNN with k = 300, row-standardised, at both levels
+# (`stated_knn300`). That is not the matrix that produced the submitted
+# Table 5:
+#   cell level  -> a 6,100 m distance band (`band6100_aggregated`) reproduces
+#                  every submitted LM statistic, Area coefficient, centrality
+#                  coefficient and pseudo-R2 for BC/FK/PC1/PC2 to 3 decimals;
+#                  k = 300 does not.
+#   point level -> a 7,450 m distance band (`band7450_disaggregated`)
+#                  reproduces all twenty submitted LM statistics (see below);
+#                  neither k = 300 nor k = 8 does.
+# The validation gate runs every spec in `gate_specs[<level>]` and scores the
+# one named in `active[<level>]`.
+# -----------------------------------------------------------------------------
+weights:
+  # The matrices that reproduce the submitted tables. The validation gate
+  # scores these.
+  active:
+    aggregated: band6100_aggregated
+    disaggregated: band7450_disaggregated
+  # The revised manuscript's matrices: kNN k = 6 at the cell level and k = 8 at
+  # the point level, chosen by the W-choice rule (`sensitivity.w_choice`).
+  # The revision analyses of stage 4 are estimated under these.
+  proposed:
+    aggregated: proposed_aggregated_k6
+    disaggregated: proposed_disaggregated_k8
+  gate_specs:
+    aggregated:    [stated_knn300, band6100_aggregated]
+    disaggregated: [stated_knn300, proposed_disaggregated_k8, band7450_disaggregated]
+  # SARAR fits skipped by the gate's fast mode (`make gate FAST=1`): the
+  # 7,450 m band's fits take one to two hours each. Its LM statistics, which
+  # are what identify it, are still computed and scored.
+  gate_slow_specs: [band7450_disaggregated]
+  stated_knn300:               # the specification the paper text states
+    type: knn
+    k: 300
+    style: "W"
+    symmetrise: false          # kNN is asymmetric; sphet does not require symmetry
+  # --- the matrix behind the submitted point-level Table 5 ------------------
+  # The frozen 7,767-point sample reproduces the OLS stage of the first-round
+  # analysis to five decimals, so the submitted LM rows depend only on W. Under
+  # this band all twenty of them reproduce (worst deviation 0.19 %). kNN is
+  # excluded at every k (the k implied by each measure differs about sevenfold)
+  # and binary weights are excluded (LM-lag off by -86 % to -98 %). The bias is
+  # uniformly positive at 7,450 m and uniformly negative at 7,455 m, which
+  # brackets the value; 7,450 m is the declared one. It is a very smooth
+  # matrix: on average 4,672 neighbours out of 7,767, and no islands.
+  band7450_disaggregated:
+    type: distance_band
+    d_max_m: 7450
+    style: "W"
+  # 165 of the 7,767 point-level observations (2.12 %) share coordinates with
+  # another point: 53 clusters, the largest holding 24 points at one location.
+  # `knearneigh` then warns about identical points, and the k-nearest list is
+  # not uniquely defined -- it depends on row order.
+  identical_points:
+    disaggregated_n: 165
+    clusters: 53
+    largest_cluster: 24
+    # `sort_by_key`: before any neighbour list is built, the analysis frame is
+    # sorted by `tie_break_key`, so the way `knearneigh` breaks an exact tie is
+    # a function of the rows' own attributes and not of the order the file was
+    # written in. It does not remove the ties (135 lists at k = 8 remain exactly
+    # tied); it fixes how they are broken. Jittering or deduplicating the
+    # points would change the sample or the coordinates; both are run as
+    # sensitivity variants in src/47_sample_sensitivity.R instead.
+    handling: sort_by_key      # as_is | sort_by_key
+    # One key per level, applied in order, ascending, in the C locale (radix
+    # sort), so the result does not depend on LC_COLLATE. The key must be
+    # unique over the analysis sample or order_for_weights() stops.
+    #   disaggregated: `id`, the frozen layer's record id: 9,030 distinct
+    #     values, no nulls, already ascending in the stored file, so the sort
+    #     leaves the stored order unchanged. The address key
+    #     `[Endereco, Unidade]` is not unique (21 rows repeat one); `id` alone
+    #     separates every row.
+    #   aggregated: the 500 m grid layer's `id`, 821 distinct values, likewise
+    #     already ascending. (`[row_index, col_index]` is also unique but is not
+    #     the stored order, so it would move the k = 6 lattice ties.)
+    #   maup_250m / maup_500m / maup_1000m: `cell_id`, the grid's own
+    #     `<row>_<col>` (250 m / 1,000 m) or numeric (500 m) identifier; the
+    #     frozen 500 m layer calls it `id`, and src/45_maup.R copies it across
+    #     via `revision.maup.cell_id_column`, so one key serves every source at
+    #     a level. Unique on every layer (3,802 / 821 / 348 values). At 500 m
+    #     `cell_id` is the stored order; at 250 m and 1,000 m the identifier
+    #     sorts row-first while the files are stored column-major, so the sort
+    #     reorders those layers and decides their k-nearest ties.
+    tie_break_key:
+      disaggregated: [id]
+      aggregated:    [id]
+      maup_250m:     [cell_id]
+      maup_500m:     [cell_id]
+      maup_1000m:    [cell_id]
+  proposed_disaggregated_k8:   # the revised point-level matrix; also the k of
+    type: knn                  # the authors' first-round point-level script
+    k: 8
+    style: "W"
+  band6100_aggregated:         # the matrix behind the submitted cell-level Table 5
+    type: distance_band
+    d_max_m: 6100
+    style: "W"
+    # Mean 242 neighbours (min 1, max 384). With this W, sphet's GMM error
+    # parameter reaches the nlminb bound (+0.9) for CC and BC with het = TRUE;
+    # those fits are not converged interior estimates. The gate flags any
+    # spatial parameter within 1e-6 of the bound.
+  proposed_aggregated_k6:      # the revised cell-level matrix
+    type: knn
+    k: 6
+    style: "W"
+  knn8_aggregated:             # k = 8 at the cell level, carried so the
+    type: knn                  # boundary result does not rest on one
+    k: 8                       # neighbour count
+    style: "W"
+  spreg_parameter_bound: 0.9
+  sensitivity:
+    k_grid: [10, 50, 100, 300]
+    # Band distances swept alongside the 6,100 m band. 6,100 m is the smallest
+    # round band with no islands: the largest first-nearest-neighbour distance
+    # on the 812-hexagon analysis layer is 6,082.8 m, so every shorter band
+    # leaves at least one isolated hexagon (see `band_islands`).
+    band_grid_m: [3000, 4500, 6100]
+    # Named specs swept by `make revision-agg`, in report order. Each resolves
+    # to a `weights.<name>` block, so build_weights() constructs it exactly as
+    # the gate does.
+    specs:
+      aggregated: [band6100_aggregated, band_4500m, band_3000m,
+                   knn_k10, knn_k50, knn_k100, stated_knn300]
+    # --- the W-choice sweep (src/40_w_choice.R) -----------------------------
+    # `src/40_revision.R --mode w_sweep` / `--mode cv`. kNN at both levels, on
+    # one grid and one code path, so the two levels' rows are comparable. This
+    # block is separate from `specs` above, which `make revision-agg` sweeps.
+    #
+    # `k_grid` is the ordered grid the choice rule walks ("the next larger
+    # k"). `reference_specs` are run and tabulated for contrast but are not
+    # part of the grid and cannot satisfy the rule.
+    w_choice:
+      k_grid:
+        aggregated:    [6, 8, 10, 25, 50, 100, 300]
+        disaggregated: [8, 10, 25, 50, 100, 300]
+      specs:
+        aggregated:    [knn_k6, knn_k8, knn_k10, knn_k25,
+                        knn_k50, knn_k100, stated_knn300]
+        disaggregated: [knn_k8, knn_k10, knn_k25,
+                        knn_k50, knn_k100, stated_knn300]
+      reference_specs:
+        aggregated:    [band6100_aggregated]   # the submitted cell-level W
+        disaggregated: []
+      # Block CV (protocol in `revision.spatial_cv`). Fewer specs than the
+      # sweep: each fold refits five SARARs, so a CV row costs about ten sweep
+      # rows per scheme.
+      # knn_k50 is included because it is the fourth aggregated matrix that
+      # gives interior, stationary fits on the rebuilt dependent variable.
+      cv_specs:
+        aggregated:    [knn_k6, knn_k8, knn_k10, knn_k50, band6100_aggregated]
+        disaggregated: [knn_k8, knn_k10, knn_k25, knn_k50, stated_knn300]
+      # --- the choice rule ---------------------------------------------------
+      # A k is interior if all five SARAR fits have |rho| < bound - bound_eps
+      # and lambda < lambda_max. A k is stable if, against the next larger k in
+      # `k_grid`, no measure that is significant (p < alpha) at either k
+      # changes its sign or its significance; a sign flip of a coefficient
+      # insignificant at both k does not count. The recommendation is the
+      # smallest k that is both. The stricter reading (every sign and every
+      # verdict must agree) is reported beside it in stage4_w_choice_rule.csv
+      # (`*_all_signs` columns). The largest k in the grid has no successor, so its stability is
+      # undefined rather than true.
+      rule:
+        bound: 0.9              # == weights.spreg_parameter_bound
+        bound_eps: 1.0e-6
+        lambda_max: 1.0
+        alpha: 0.05
+  # A distance band shorter than 6,082.8 m disconnects at least one hexagon.
+  # nb2listw(zero.policy = FALSE) refuses such a list, and a zero-weight row is
+  # not a defensible neighbourhood either, so the isolated units are dropped
+  # for that spec and N is recorded per spec in every table. The 6,100 m band
+  # has no islands, so N = 812 there.
+  band_islands: drop_isolated   # drop_isolated | zero_policy
+  band_4500m:
+    type: distance_band
+    d_max_m: 4500
+    style: "W"
+  band_3000m:
+    type: distance_band
+    d_max_m: 3000
+    style: "W"
+  # --- the W-choice sweep's kNN grid ----------------------------------------
+  # k = 6 and k = 8 are the same matrices as `proposed_aggregated_k6` /
+  # `knn8_aggregated`; they are named separately so that the sweep's rows at
+  # both levels come from one grid of level-neutral specs.
+  knn_k6:
+    type: knn
+    k: 6
+    style: "W"
+  knn_k8:
+    type: knn
+    k: 8
+    style: "W"
+  knn_k10:
+    type: knn
+    k: 10
+    style: "W"
+  knn_k25:
+    type: knn
+    k: 25
+    style: "W"
+  knn_k50:
+    type: knn
+    k: 50
+    style: "W"
+  knn_k100:
+    type: knn
+    k: 100
+    style: "W"
+  # --- MAUP comparability specs ---------------------------------------------
+  # The 6,100 m band fixes the metric neighbourhood, so the number of
+  # neighbours scales with cell density: 723.6 at 250 m, 242.3 at 500 m, 74.0
+  # at 1,000 m. Estimates at the smooth end of that range are unstable, so a
+  # MAUP table run on the band alone could not separate "cell size changed the
+  # answer" from "W got smoother". These two families hold the other quantity
+  # fixed.
+  knn_k242:                    # constant neighbour count across cell sizes:
+    type: knn                  # 242 = the mean degree of the 6,100 m band on
+    k: 242                     # the 812-cell 500 m layer
+    style: "W"
+  # Constant neighbour share across cell sizes: k = round(0.29803 * N), where
+  # 0.29803 = 242.3 / 812 is the share of the 500 m sample the 6,100 m band
+  # averages over. N is the post-positivity sample per size (2,025 / 812 /
+  # 299), so at 500 m this spec is knn_k242 and is not listed twice. The k
+  # values are written out so that every W in the sweep is a named spec.
+  #
+  # There is no 250 m constant-share spec. It would need k = round(0.29803 *
+  # 2025) = 604, and `spdep::knearneigh()` refuses any k >= 500 (with the
+  # message "too many ties in knearneigh", also on tie-free point clouds). It
+  # is dropped and reported, not capped. The 6,100 m band at 250 m already
+  # averages over 724 of 2,025 cells (35.8 % of the sample, against 29.8 % at
+  # 500 m), so it covers much of the same ground.
+  maup_knn_share_1000m:
+    type: knn
+    k: 89                      # round(0.29803 * 299)
+    style: "W"
+
+# -----------------------------------------------------------------------------
+# Stage 0b -- profiling conventions (src/00_profile.py).
+#
+# Nothing here changes an estimate; it fixes how the profile measures the data,
+# so the profile's numbers can be audited.
+# -----------------------------------------------------------------------------
+profiling:
+  # --- address normalisation, used at every join -----------------------------
+  address:
+    fold_accents: true            # NFKD + drop combining marks (registry side)
+    upper_case: true
+    strip_punctuation: true       # non-alphanumerics -> single space, collapsed
+    # The registry carries 13,971 literal '?' where accented characters were
+    # lost. ITBI and the geolayer are accent-stripped ASCII, so the registry
+    # side is matched with '?' standing for exactly one character; 'literal'
+    # would drop those records.
+    question_mark: wildcard       # wildcard | literal
+    # The join key is street + number (ITBI has no complete-address field).
+  # --- fuzzy matching is a diagnostic, never an acceptance rule --------------
+  # rapidfuzz scores. There is no acceptance threshold: no fuzzy match is
+  # written into any analysis dataset. Scores are reported to show how near the
+  # failures were.
+  fuzzy:
+    scorer: WRatio
+    report_threshold: 85          # failures scoring >= this are listed
+    failure_sample_n: 40          # rows in the failure sample table
+  # --- purpose -> category mapping --------------------------------------------
+  purpose:
+    # `Purpose_EN` exists only in raw.itbi_xlsx. Registry and geolayer purposes
+    # are translated by resolving their (accent-folded, '?'-wildcarded)
+    # spelling onto the ITBI vocabulary; values that do not resolve are flagged.
+    en_column: Purpose_EN
+    # Ordered rules, first match wins, applied to the normalised purpose string.
+    # `confidence: low` marks a judgement call; such rows are flagged in the
+    # mapping table.
+    rules:
+      - {category: missing,     subcategory: unknown,           confidence: high,   pattern: "^$"}
+      - {category: parking,     subcategory: parking_space,     confidence: high,   pattern: "ESTACIONAMENTO"}
+      - {category: parking,     subcategory: garage_building,   confidence: medium, pattern: "GARAGEM"}
+      - {category: special,     subcategory: residual_area,     confidence: low,    pattern: "AREA A VISTORIAR|SOBRA DE AREA"}
+      - {category: special,     subcategory: projected_plot,    confidence: low,    pattern: "AREA PROJETADA DE GLEBA"}
+      - {category: special,     subcategory: vacant_land,       confidence: high,   pattern: "^TERRENO|^GLEBA"}
+      - {category: special,     subcategory: special_property,  confidence: medium, pattern: "^IMOVEL ESPECIAL"}
+      - {category: commercial,  subcategory: hospitality,       confidence: low,    pattern: "HOTEL"}
+      - {category: residential, subcategory: apartment,         confidence: high,   pattern: "^APARTAMENTO"}
+      - {category: residential, subcategory: house,             confidence: high,   pattern: "^RESIDENCIA"}
+      - {category: commercial,  subcategory: retail,            confidence: high,   pattern: "^LOJA"}
+      - {category: commercial,  subcategory: office,            confidence: high,   pattern: "^SALA"}
+      - {category: commercial,  subcategory: commercial_unit,   confidence: high,   pattern: "UNIDADE .*COMERCIO"}
+      - {category: commercial,  subcategory: fuel_station,      confidence: high,   pattern: "POSTO DE COMBUSTIVEL"}
+      - {category: commercial,  subcategory: industrial,        confidence: medium, pattern: "INDUSTRIAL|ARMAZEM|DEP.SITO|DEPOSITO"}
+    # --- parking definitions ----------------------------------------------
+    # Three nested definitions, so the profile can show that the headline
+    # figures do not hinge on the edge cases. `standard` reproduces the
+    # parking figures quoted in the second-round review.
+    parking_definitions:
+      narrow:   "^ESPACO (?:DE )?ESTACIONAMENTO|^ESPACO ESTACIONAMENTO"
+      standard: "ESTACIONAMENTO|GARAGEM"
+      broad:    "ESTACIONAMENTO|GARAGEM|\\bBOX\\b|\\bVAGA\\b"
+    active_parking_definition: standard
+  # --- unit-count conventions profiled side by side --------------------------
+  unit_count_conventions: [all, non_parking, non_parking_non_parent]
+  # --- plot area ---------------------------------------------------------------
+  plot_area:
+    mega_plot_flag_m2: 100000     # reported as a flag, not an exclusion
+    conflict_rel_tol: 0.01        # |a-b|/b above this counts as a conflict
+    sources: [geolayer, registry, itbi]
+  # --- reverse-engineering the frozen `Preco` --------------------------------
+  # Profiling only: scores candidate conventions against the frozen column, so
+  # the stage-1 rebuild starts from evidence rather than from the paper's prose.
+  preco_reverse_engineering:
+    enabled: true
+    price_stats: [mean, median]
+    price_subsets: [all, non_parking]
+    unit_subsets: [all, non_parking, non_parking_non_parent]
+    dedupe_grid: [keep, dedupe]
+    match_rel_tol: 0.01
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+models:
+  # Every spatial model is estimated by GMM with sphet::spreg; the LM tests
+  # select among OLS, SEM, SAR and SARAR (revision.lm_selection).
+  het: true
+  # Every model regresses ln(unit value) on ln(plot area) + ln(centrality), as
+  # the submitted Table 5 does (it prints an Area coefficient in all ten
+  # columns). The first-round point-level script omitted ln(plot area) from
+  # four of the five models; here the control is in every model.
+  controls: [plot_area]
+  controls_all_models: true
+  lm_tests: true
+  # The gate reproduces the submitted SARAR fits; the revision analyses follow
+  # the LM decision rules (`revision.lm_selection`).
+  select_by_lm: false
+
+# -----------------------------------------------------------------------------
+# Validation gate targets: the submitted values (about 3 significant figures)
+# -----------------------------------------------------------------------------
+validation:
+  # Submitted Table 4: Pearson r of ln(unit value) with ln(measure).
+  correlations:
+    disaggregated: {PC1: 0.3907, PC2: 0.3705, CC: 0.2617, BC: -0.0095, FK: -0.0267}
+    aggregated:    {PC1: 0.5427, PC2: 0.5039, CC: 0.4634, BC: 0.1831, FK: 0.2221}
+  # Table 5. Every model is ln_Puni ~ ln_Area + ln_<measure>.
+  # Cell-level CC: the beta and pseudo-R2 are identical to FK's (0.0844 /
+  # 0.4695), which suggests a transcription error in the submitted table. They
+  # are kept as targets so the miss is visible, but a miss there is not a
+  # pipeline defect.
+  pseudo_r2:
+    disaggregated: {PC1: 0.4036, PC2: 0.4213, FK: 0.4212, BC: 0.4205, CC: 0.074}
+    aggregated:    {PC1: 0.3226, PC2: 0.4760, BC: 0.4738, CC: 0.4695, FK: 0.4695}
+  coef_area:
+    disaggregated: {CC: -0.3716, BC: -0.3619, FK: -0.3599, PC1: -0.3595, PC2: -0.3677}
+    aggregated:    {CC: -0.2407, BC: -0.2408, FK: -0.2407, PC1: -0.2241, PC2: -0.2293}
+  coef_measure:
+    disaggregated: {CC: 1.0077, BC: -0.0038, FK: -0.0203, PC1: 0.3925, PC2: -0.0107}
+    aggregated:    {CC: 0.0844, BC: 0.0703, FK: 0.0844, PC1: 1.1482, PC2: 0.6264}
+  # LM tests on the OLS residuals. They depend on W and not on the GMM fit,
+  # which makes them the most direct fingerprint of the W behind the table.
+  # The table labels them LM-Error/LM-lag/RLM-Error/RLM-lag at the point level
+  # (the older spdep lm.LMtests names) and Rserr/Rslag/adjRSerr/adjRSlag at the
+  # cell level (the newer lm.RStests names): the two levels were run with
+  # different spdep versions.
+  lm_err:
+    disaggregated: {CC: 234865, BC: 568517, FK: 568946, PC1: 152377, PC2: 124537}
+    aggregated:    {CC: 4299.6, BC: 7677.3, FK: 7030.5, PC1: 3716.7, PC2: 2762.4}
+  lm_lag:
+    disaggregated: {CC: 20228, BC: 149080, FK: 150688, PC1: 5199.1, PC2: 6735.6}
+    aggregated:    {CC: 1424.8, BC: 4675.3, FK: 3658.5, PC1: 778.91, PC2: 742.01}
+  rlm_err:
+    disaggregated: {CC: 215370, BC: 420363, FK: 419185, PC1: 147301, PC2: 118031}
+    aggregated:    {CC: 2874.7, BC: 3134.7, FK: 3488.6, PC1: 2831.3, PC2: 2031.1}
+  rlm_lag:
+    disaggregated: {CC: 732.10, BC: 926.02, FK: 926.83, PC1: 122.91, PC2: 229.76}
+    aggregated:    {CC: 0.03, BC: 132.65, FK: 116.61, PC1: 12.26, PC2: 10.73}
+  # Scoring tolerance: |delta| <= max(abs_tol, rel_tol * |target|).
+  tolerance: {abs: 0.005, rel: 0.01}
+  # Table 3, reproduced on the N = 7,767 analysis sample (not on the full
+  # 9,030) for mean, relative range and CV, all five measures.
+  # relative range = (max - min) / mean ; CV = sd / mean * 100
+  relative_range:
+    disaggregated:
+      PC1: 3.06
+      PC2: 1.01
+      CC:  0.92
+      BC:  34.94
+      FK:  25.63
+  cv:
+    disaggregated:
+      PC1: 54.58
+      PC2: 19.74
+      CC:  15.67
+      BC:  240.97
+      FK:  198.05
+  mean_value:
+    disaggregated:
+      PC1: 2.01
+      PC2: 1.25
+      CC:  6.58
+      BC:  1.235e6
+      FK:  1.0574e4
+  # Table 3's submitted "Hierarchy" column. It does not reproduce under the
+  # Pareto definition of paper Sec. 4.4 (top-20 % sum / bottom-80 % sum) or
+  # under top-20 % / total; src/51_table3_hierarchy.py recomputes it under the
+  # stated definition and reports these values beside it.
+  hierarchy_submitted:
+    disaggregated: {PC1: 0.90, PC2: 0.83, CC: 0.83, BC: 0.99, FK: 0.98,
+                    land_value: 0.94}
+  # The Pareto ratio: the sum of the top share of values over the sum of the rest.
+  hierarchy_top_share: 0.20
+  # Parking diagnostics quoted in the second-round review, recomputed by the
+  # profile. The first seven reproduce the quoted figure; the last two depend
+  # on a stated convention.
+  parking_reference:
+    share: 0.341                       # quoted "34%"
+    median_price_parking: 70000        # quoted 70,000
+    median_price_other: 326200         # quoted 326,200
+    purpose_and_built_area_present: 0.960   # quoted "96%"
+    addresses_only_parking: 171        # quoted 171
+    registry_parking_share: 0.263      # quoted "26.3%"
+    mixed_building_parking_share: 0.50 # quoted "half" (median 50.0 %)
+    addresses_mean_price_changed: 0.220     # quoted "20.7%"; 22.0 % here
+    median_change_denominator: corrected    # |delta| / parking-excluded mean
+    median_change: 0.389                    # quoted "40%"; 38.9 % on that basis
+                                            # (63.6 % if divided by the
+                                            # original mean)
+
+# -----------------------------------------------------------------------------
+# Stage 4 -- the revision analyses.
+# -----------------------------------------------------------------------------
+revision:
+  parking:
+    headline: exclude_parking_and_units   # exclude transactions and units
+    alternates: [parking_in_multiplier_only, parking_in_both]
+  # How the two extra controls are defined. The referees asked for built area
+  # or development intensity and for unit count as controls; neither variable
+  # exists ready-made, so the definition is a convention and is set here.
+  #
+  # `unit_count` is U(a), the dependent variable's own multiplier -- stage 1's
+  # `n_units` column, not a fresh count. It is therefore in the dependent
+  # variable's numerator by construction (ln Puni = ln price_stat + ln U -
+  # ln Terreno, exactly); the report says so and the script checks the
+  # identity numerically.
+  #
+  # `built_area` is summed over exactly the registry rows U(a) counts -- the
+  # deduplicated registry, `multiplier_units: non_parking`, parent rows
+  # included, and the same only-parking fallback -- so the built area and the
+  # unit count in one regression come from the same rows.
+  controls:
+    built_area:
+      source: registry              # registry | itbi_sold | geolayer_record
+      column: "Built Area"
+      rows: dv_multiplier_units     # the same mask that produces `n_units`
+      aggregate: sum                # per address, over those rows
+      # `Built Area` is the literal string INDETERMINADO on 30,586 of 844,739
+      # registry rows. An address is determinate only if none of its counted
+      # rows carries the code and the sum is > 0. The models with built area
+      # run on that subsample, and the headline specification is re-run on the
+      # same subsample so the comparison is like-for-like.
+      indeterminate_code: INDETERMINADO
+      determinacy: all_counted_rows_numeric   # all_counted_rows_numeric | any_row_numeric
+      # Reported beside the headline definition, never substituted for it.
+      alternates: [registry_all_rows, itbi_sold_mean, geolayer_area_const]
+    unit_count:
+      source: stage1_n_units        # dependent_variable.rebuilt_path, column `n_units`
+    # One row per frozen-layer record, written by src/49_built_area.py and read
+    # by src/49_controls_types.R; keyed on the layer's own `id`.
+    path: data/interim/controls_built_area.csv
+  # The property-type split. The frozen point layer carries an 8-way `Type`
+  # classification: apartment 6159 / single-family open 1323 / retail-service
+  # 701 / vacant 502 / single-family gated 297 / industry 23 / other 18 /
+  # public 7.
+  property_type_split:
+    enabled: true
+    column: Type
+    min_n_per_group: 200        # smaller groups are reported, not estimated
+    # Which W a within-group model uses. `within_group` rebuilds the k = 8 list
+    # on the group's own points, so every unit still has 8 neighbours and the
+    # specification is the one being split; `restricted` keeps the pooled
+    # 7,775-point list and deletes the out-of-group columns, so the geometry is
+    # the pooled one but neighbour counts fall (and small groups lose units to
+    # islands). Both are run; `within_group` is the headline and `restricted`
+    # the robustness line.
+    w: within_group             # within_group | restricted
+    # Under `restricted`, group members left with no in-group neighbour are
+    # handled like the distance-band islands (`weights.band_islands`): dropped
+    # for that variant only, and counted.
+  # Network-extent (boundary) sensitivity: centralities recomputed on the
+  # network clipped to a smaller extent, and the cell-level analysis re-run on
+  # them.
+  boundary_sensitivity:
+    # How a variant run is produced: clip `inputs.base_network` to the extent,
+    # keeping (node1, node2) stable, then run the solver of record with
+    # `inputs.pc_solver.submitted_run` (kernels.from_graph -> Model ->
+    # evolve(max_iter=200), as in reconstruct_paper_run.py). Only the extent
+    # moves. A variant is a partial network, so `make pc-accept` is run in
+    # informational mode: it reports coverage and the tier-1 numbers on the
+    # shared segments and decides nothing.
+    #
+    # ---- how a variant extent is constructed ----------------------------
+    # The submitted extent is not available as a polygon; it is whatever region
+    # the 65,357 delivered segments cover, so it is reconstructed.
+    extent:
+      # The union of the 30 m buffers of every segment of the file of record.
+      # 30 m is the buffer that defines the static weight R
+      # (`rebuild_segment_areas.BUFFER`), so the extent polygon and the
+      # capacity rule measure the city at the same width. A concave hull would
+      # add a free parameter of its own and would bridge the Guaíba and the
+      # unbuilt gaps the network does not cover.
+      rule: union_of_30m_segment_buffers
+      buffer_m: 30.0
+      quad_segs: 8
+    # A segment is kept only if it lies entirely inside the variant polygon;
+    # geometries are never cut. Cutting would leave the stored `dist` column
+    # (which the solver reads) describing a segment that no longer exists,
+    # would move the zone off the midpoint of its street, and would give GAUS
+    # dangling ends that `touches` connects differently. Dropping whole
+    # segments keeps (node1, node2) stable and makes each variant network a
+    # subgraph of the reference one.
+    clip_rule: drop_segments_not_fully_inside   # drop_segments_not_fully_inside |
+                                                # clip_geometries
+    # R is rebuilt on every variant (src/14_boundary_variants.py), and the
+    # segment enumeration order is recorded in the variant manifest.
+    variants:
+      # `write_layer()` names the layer after the file stem, so the layer
+      # names below are the stems.
+      - {label: bn2000, inward_buffer_m: -2000.0,
+         network: data/interim/boundary_bn2000_network.gpkg,
+         network_layer: boundary_bn2000_network,
+         edges: data/interim/boundary_bn2000_edges.gpkg,
+         edges_layer: boundary_bn2000_edges}
+      - {label: bn4000, inward_buffer_m: -4000.0,
+         network: data/interim/boundary_bn4000_network.gpkg,
+         network_layer: boundary_bn4000_network,
+         edges: data/interim/boundary_bn4000_edges.gpkg,
+         edges_layer: boundary_bn4000_edges}
+    # The PC runs on each variant use the submitted parameters (gamma in
+    # {1, 0}, beta = 2, 200 iterations); only the extent moves. The columns
+    # therefore carry the submitted names (`cd1g1b2k0` / `cd4g0b2k0`), since
+    # the naming convention encodes (run, gamma, beta, Dp) and none of those
+    # changed. The extent is carried by the file name and the manifest, which
+    # also lets `make pc-accept` score a variant against the submitted columns
+    # on the segments the two extents share.
+    pc_runs:
+      - {gamma: 1, beta: 2.0, dp: 0, run: 1, density_column: cd1g1b2k0,
+         mass_column: ca1g1b2k0, measure: PC1}
+      - {gamma: 0, beta: 2.0, dp: 0, run: 4, density_column: cd4g0b2k0,
+         mass_column: ca4g0b2k0, measure: PC2}
+    # Stage 2 for the variants (src/23_boundary_layers.py): the 500 m cells
+    # restricted to those the variant covers completely (same segment count as
+    # the reference under `intersects`), and the frozen address points
+    # restricted to those whose nearest reference segment survives the clip --
+    # the same restrictions the acceptance test uses for a partial network
+    # (pc_acceptance.tier2/3).
+    aggregated_layer: data/interim/boundary_aggregated_500m.gpkg
+    points_table: data/interim/boundary_points.csv
+    # Rank agreement between extents is Spearman's rho.
+    # The variant files. PC columns come from `make boundary-pc`, CC/BC/FK from
+    # `make gaus-native` on each variant's edges layer, and each file has been
+    # through `make pc-accept` / `make gaus-accept` in informational mode.
+    input_files:
+      - {label: bn2000, path: data/interim/pc_boundary_bn2000.gpkg,
+         layer: pc_boundary_bn2000, PC1: cd1g1b2k0, PC2: cd4g0b2k0,
+         gaus: data/interim/gaus_headless_boundary_bn2000.gpkg,
+         gaus_layer: gaus_headless_boundary_bn2000,
+         mode: informational, role: variant}
+      - {label: bn4000, path: data/interim/pc_boundary_bn4000.gpkg,
+         layer: pc_boundary_bn4000, PC1: cd1g1b2k0, PC2: cd4g0b2k0,
+         gaus: data/interim/gaus_headless_boundary_bn4000.gpkg,
+         gaus_layer: gaus_headless_boundary_bn4000,
+         mode: informational, role: variant}
+
+    # =========================================================================
+    # The municipal family: the network clipped to the Porto Alegre municipal
+    # polygon (IBGE Malha Municipal Digital 2025) and to that polygon plus a
+    # 1 km collar. This is the family the manuscript reports; the
+    # negative-buffer family above is kept as a stress test.
+    #
+    # Only 29,924 of the 65,357 delivered segments (45.8 %) lie inside the
+    # municipality; the rest reach a median 5.1 km and a maximum 16.4 km beyond
+    # the municipal limit. The variants are therefore outward buffers of the
+    # municipal polygon rather than inward buffers of the network's footprint.
+    # =========================================================================
+    municipal:
+      boundary:
+        path: data/frozen/boundary/RS_Municipios_2025.shp
+        layer: RS_Municipios_2025
+        source_crs_epsg: 4674        # SIRGAS 2000 geographic, as delivered
+        id_column: CD_MUN
+        name_column: NM_MUN
+        cd_mun: "4314902"
+        nm_mun: Porto Alegre
+        # the extracted, dissolved, reprojected polygon this family clips with
+        polygon: data/interim/poa_municipality.gpkg
+        manifest: data/interim/poa_municipality_manifest.json
+      # A variant is the municipal polygon buffered outward by
+      # `outward_buffer_m` (>= 0): mu0 is the municipality itself, mu1 adds a
+      # 1 km collar. The full delivered extent is the third member of the
+      # sequence and needs no run.
+      clip_rule: drop_segments_not_fully_inside   # as for the negative buffers;
+                                                  # R is rebuilt on every variant
+      # Connectedness. A clip can cut the routing graph, and on a disconnected
+      # graph the 200-iteration run does not settle. Every municipal variant is
+      # therefore reduced to the largest connected component of its own
+      # routing graph before R is rebuilt and before the solver runs; the raw
+      # component sizes are recorded in the variant manifest either way.
+      connectedness: largest_component        # largest_component | as_clipped
+      tiny_component_segments: 50             # reported as a diagnostic only
+      variants:
+        - {label: mu0, outward_buffer_m: 0.0,
+           network: data/interim/boundary_mu0_network.gpkg,
+           network_layer: boundary_mu0_network,
+           edges: data/interim/boundary_mu0_edges.gpkg,
+           edges_layer: boundary_mu0_edges}
+        - {label: mu1, outward_buffer_m: 1000.0,
+           network: data/interim/boundary_mu1_network.gpkg,
+           network_layer: boundary_mu1_network,
+           edges: data/interim/boundary_mu1_edges.gpkg,
+           edges_layer: boundary_mu1_edges}
+      # Everything this family writes carries this suffix, so the two families
+      # never overwrite each other's tables.
+      table_suffix: muni
+      aggregated_layer: data/interim/boundary_muni_aggregated_500m.gpkg
+      points_table: data/interim/boundary_muni_points.csv
+      input_files:
+        - {label: mu0, path: data/interim/pc_boundary_mu0.gpkg,
+           layer: pc_boundary_mu0, PC1: cd1g1b2k0, PC2: cd4g0b2k0,
+           gaus: data/interim/gaus_headless_boundary_mu0.gpkg,
+           gaus_layer: gaus_headless_boundary_mu0,
+           mode: informational, role: variant}
+        - {label: mu1, path: data/interim/pc_boundary_mu1.gpkg,
+           layer: pc_boundary_mu1, PC1: cd1g1b2k0, PC2: cd4g0b2k0,
+           gaus: data/interim/gaus_headless_boundary_mu1.gpkg,
+           gaus_layer: gaus_headless_boundary_mu1,
+           mode: informational, role: variant}
+      # The weight specifications the SARAR is run under. The submitted
+      # 6,100 m band is kept for comparison; k = 6 is the revised cell-level W
+      # and the headline; k = 8 is carried so the result does not rest on one
+      # neighbour count. All three resolve through `weights.<name>`.
+      w_specs:
+        submitted_band: band6100_aggregated
+        k6:        proposed_aggregated_k6
+        k8:        knn8_aggregated
+      headline_w: k6
+  # The performance criterion used to compare the five measures: the
+  # standardized coefficient and the block-CV RMSE. The pseudo-R2 is reported
+  # but not used for ranking, and in-sample level-scale error metrics are not
+  # reported.
+  # Standardized coefficients: the covariates (ln_plot_area, ln_<measure>)
+  # are z-standardised and the response stays in logs, so a standardized beta
+  # reads as "effect on ln(unit value) of a one-SD move in the log measure" and
+  # is comparable across measures, which raw betas are not.
+  standardize_coefficients: true
+  # Anselin's LM decision rules, applied per (W, measure).
+  lm_selection:
+    alpha: 0.05
+    # Neither LM test significant -> OLS. Exactly one significant -> that
+    # model. Both significant -> decide on the robust pair: if only one robust
+    # test is significant take that model; if both are, apply
+    # `both_robust_significant`.
+    both_robust_significant: sarar        # sarar | larger_robust_statistic
+  # Out-of-sample check. Spatial block CV rather than random k-fold: with
+  # strong residual autocorrelation, random folds leak neighbouring
+  # observations across the split and flatter every measure. Block CV is the
+  # stricter test. W is rebuilt inside every training fold, so no information
+  # leaks through W, and the metric is the RMSE.
+  spatial_cv:
+    n_blocks: 10
+    method: kmeans_on_coords
+    prediction: trend_only                # trend_only | trend_plus_signal
+    # trend_only = X_test %*% beta_train. With a large lambda this
+    # systematically under-predicts the level of y, because E[y] =
+    # (I - lambda W)^-1 X beta and that factor cannot be formed without the test
+    # units' rows of W, i.e. without leakage. Recalibrating the intercept on the
+    # training residual mean removes the level bias using training data only.
+    # Both the raw and the recalibrated RMSE are reported.
+    intercept_recalibration: true
+    # Random k-fold on the same data, reported as a comparison line to show the
+    # size of the leakage.
+    random_kfold_comparison: true
+    n_folds_random: 10
+    # Every CV run also fits an OLS baseline on the same folds and formula,
+    # which answers "does the spatial model add out-of-sample accuracy?"
+    # separately from "which measure wins?". Two benchmarks are scored on the
+    # same blocks with the same RMSE: `null_training_block_mean` (the mean of
+    # the training blocks, intercept only) and `null_plot_area_only` (OLS of
+    # the log outcome on log plot area alone, fitted on the training blocks).
+    # The gap between a model and the second is the improvement attributable
+    # to the centrality measure; the gap to the first includes plot area.
+    w_spec:
+      aggregated: band6100_aggregated   # the submitted cell-level W
+  # MAUP (src/45_maup.R, `make maup`): the cell-level analysis on 250 m, 500 m
+  # and 1,000 m hexagons, with the segment centralities aggregated to each grid
+  # by stage 2.
+  maup:
+    hex_sizes_m: [250, 500, 1000]
+    # One record per layer the analysis reads. `provenance` distinguishes the
+    # frozen 500 m layer from stage 2's rebuild of it; running both ties the
+    # 250 m / 1,000 m results to the submitted ones.
+    sources:
+      - {key: "250m_headline",  size_m: 250,  variant: headline,
+         provenance: rebuilt, columns: maup_250m,
+         path: data/interim/aggregated_250m_headline.gpkg}
+      - {key: "250m_parking_in_multiplier_only", size_m: 250,
+         variant: parking_in_multiplier_only, provenance: rebuilt,
+         columns: maup_250m,
+         path: data/interim/aggregated_250m_parking_in_multiplier_only.gpkg}
+      - {key: "250m_parking_in_both", size_m: 250,
+         variant: parking_in_both, provenance: rebuilt, columns: maup_250m,
+         path: data/interim/aggregated_250m_parking_in_both.gpkg}
+      # The frozen layer: submitted centralities and submitted Puni_mean.
+      # `cell_id_column` names the layer's own cell identifier; load_source()
+      # copies it to `cell_id`, so one tie_break_key serves the level. The
+      # frozen layer calls it `id` and the stage-2 layers `cell_id`; at 500 m
+      # they hold the same values, so this row keeps its stored order.
+      - {key: "500m_frozen",    size_m: 500,  variant: frozen_submitted,
+         provenance: frozen,  columns: aggregated, cell_id_column: id,
+         path: data/frozen/cents_aggregated.gpkg, layer: Grade_POA_complete_3}
+      - {key: "500m_headline",  size_m: 500,  variant: headline,
+         provenance: rebuilt, columns: maup_500m_rebuilt,
+         path: data/interim/aggregated_500m_headline.gpkg}
+      - {key: "500m_parking_in_multiplier_only", size_m: 500,
+         variant: parking_in_multiplier_only, provenance: rebuilt,
+         columns: maup_500m_rebuilt,
+         path: data/interim/aggregated_500m_parking_in_multiplier_only.gpkg}
+      - {key: "500m_parking_in_both", size_m: 500,
+         variant: parking_in_both, provenance: rebuilt,
+         columns: maup_500m_rebuilt,
+         path: data/interim/aggregated_500m_parking_in_both.gpkg}
+      - {key: "1000m_headline", size_m: 1000, variant: headline,
+         provenance: rebuilt, columns: maup_1000m,
+         path: data/interim/aggregated_1000m_headline.gpkg}
+      - {key: "1000m_parking_in_multiplier_only", size_m: 1000,
+         variant: parking_in_multiplier_only, provenance: rebuilt,
+         columns: maup_1000m,
+         path: data/interim/aggregated_1000m_parking_in_multiplier_only.gpkg}
+      - {key: "1000m_parking_in_both", size_m: 1000,
+         variant: parking_in_both, provenance: rebuilt,
+         columns: maup_1000m,
+         path: data/interim/aggregated_1000m_parking_in_both.gpkg}
+    # The stage-2 manifest the source checksums are verified against.
+    manifest: stage2_manifest.json
+    # Default name of a source layer's cell identifier, overridden per source
+    # where the layer calls it something else. The loader copies it to
+    # `cell_id`, the tie_break_key of the three maup levels.
+    cell_id_column: cell_id
+    # The W families swept at each size. Every name resolves to a
+    # `weights.<name>` block. `proposed_aggregated_k6`, the revised cell-level
+    # W, is first at every size and carries the role `revision_headline`: the
+    # manuscript's MAUP table is quoted from it, so that table's 500 m column
+    # is the revised Table 5 cell. The other specs hold the metric band, the
+    # neighbour count or the neighbour share fixed across sizes. At 500 m the
+    # constant-share spec is knn_k242, so it is not listed twice; at 250 m it
+    # cannot be built (see `weights.maup_knn_share_1000m`).
+    w_specs:
+      - {size_m: 250,  specs: [proposed_aggregated_k6,
+                               band6100_aggregated, knn_k242, knn_k10]}
+      - {size_m: 500,  specs: [proposed_aggregated_k6,
+                               band6100_aggregated, knn_k242, knn_k10]}
+      - {size_m: 1000, specs: [proposed_aggregated_k6,
+                               band6100_aggregated, knn_k242,
+                               maup_knn_share_1000m, knn_k10]}
+    w_roles:
+      proposed_aggregated_k6:   revision_headline
+      band6100_aggregated:      constant_metric_band
+      knn_k242:                 constant_neighbour_count
+      maup_knn_share_1000m:     constant_neighbour_share
+      knn_k10:                  local_interior
+    # The role src/45_maup.R reads as "the matrix the manuscript table
+    # quotes". A role rather than a spec name, so one key serves every size;
+    # exactly one spec per size may carry it.
+    headline_w_role: revision_headline
+    # spdep::knearneigh() refuses k >= 500. A spec needing more is dropped and
+    # listed in outputs/tables/stage4_maup_dropped_specs.csv.
+    # The parking variant that gets the full treatment (LM suite, selected
+    # model, standardized beta, spatial block CV). The two alternates are run
+    # for the SARAR coefficient only, at every size and every W -- enough to
+    # show whether a conclusion depends on the parking convention.
+    full_analysis_variant: headline
+    # Spatial block CV at every size, same protocol as `spatial_cv`:
+    # trend-only prediction, W rebuilt inside every training fold, 10 seeded
+    # k-means blocks, OLS and both benchmarks (training-block mean; OLS on
+    # log plot area alone). The random k-fold comparison is a
+    # statement about the CV design, not about cell size, so it is not
+    # repeated per size.
+    cv_sizes_m: [250, 500, 1000]
+    # The block-CV ranking is quoted next to the revised Table 5, so it is
+    # computed on the same matrix.
+    cv_w_spec: proposed_aggregated_k6
+    # Point-level anchor for the sign table: the point-level SARAR fits of the
+    # validation gate under the paper's stated W.
+    point_level_reference: outputs/tables/stage3_validation_results_disaggregated.csv
+    point_level_w_spec: stated_knn300
+  # Preferential-centrality parameter sensitivity (src/41_pc_beta_sensitivity.R):
+  # a (gamma, beta) grid run with the solver of record.
+  pc_sensitivity:
+    beta_grid: [1.5, 2.0, 2.25, 2.5]
+    # gamma = 1 and 0 are the two submitted measures; gamma = 0.5 locates the
+    # boundary between the two regimes. beta = 2.5 stays in the table with its
+    # non-convergence reported.
+    gamma_grid: [1, 0.5, 0]
+    # How a variant is produced: a reconstruct_paper_run.py-style call on
+    # `inputs.base_network` with every setting in
+    # `inputs.pc_solver.submitted_run` fixed and only beta (and gamma) moved --
+    # same graph, same capacities, same 200-iteration budget, kernel rebuilt
+    # for the new beta. `src/11_pc_runs.py` (`make pc-runs`) produces the grid
+    # below, one beta at a time: the dense 56,162^2 float64 kernel is 23.5 GiB,
+    # and two of them plus working copies do not fit in the memory the runs
+    # were made with.
+
+    # --- the run grid -------------------------------------------------------
+    # One GeoPackage per `label`, i.e. per beta, holding every gamma run at
+    # that beta; a label is one kernel, built once. Column names follow
+    # `cd{run}g{gamma}b{beta}k{int(100*Dp)}` with decimal points dropped, so
+    # beta 1.5 is `b15`.
+    #
+    # beta = 2.0 with gamma 1 and 0 is the submitted run recomputed, so it
+    # carries the submitted run indices 1 and 4, and `make pc-accept` scores
+    # it against `cd1g1b2k0` / `cd4g0b2k0` and must PASS. The variants use run
+    # indices 101-110, outside every index the authors' batches used.
+    runs:
+      - {label: b2,  beta: 2.0, gamma: 1, dp: 0, run: 1,
+         density_column: cd1g1b2k0,    mass_column: ca1g1b2k0,    role: reproduction}
+      - {label: b2,  beta: 2.0, gamma: 0, dp: 0, run: 4,
+         density_column: cd4g0b2k0,    mass_column: ca4g0b2k0,    role: reproduction}
+      - {label: b15, beta: 1.5, gamma: 1, dp: 0, run: 101,
+         density_column: cd101g1b15k0, mass_column: ca101g1b15k0, role: variant}
+      - {label: b15, beta: 1.5, gamma: 0, dp: 0, run: 102,
+         density_column: cd102g0b15k0, mass_column: ca102g0b15k0, role: variant}
+      - {label: b25, beta: 2.5, gamma: 1, dp: 0, run: 103,
+         density_column: cd103g1b25k0, mass_column: ca103g1b25k0, role: variant}
+      - {label: b25, beta: 2.5, gamma: 0, dp: 0, run: 104,
+         density_column: cd104g0b25k0, mass_column: ca104g0b25k0, role: variant}
+      # gamma = 0.5 over the same beta grid, plus beta = 2.25 at all three
+      # gammas under its own label `b225`.
+      - {label: b15, beta: 1.5, gamma: 0.5, dp: 0, run: 105,
+         density_column: cd105g05b15k0, mass_column: ca105g05b15k0, role: variant}
+      - {label: b2,  beta: 2.0, gamma: 0.5, dp: 0, run: 106,
+         density_column: cd106g05b2k0, mass_column: ca106g05b2k0, role: variant}
+      - {label: b25, beta: 2.5, gamma: 0.5, dp: 0, run: 107,
+         density_column: cd107g05b25k0, mass_column: ca107g05b25k0, role: variant}
+      - {label: b225, beta: 2.25, gamma: 1, dp: 0, run: 108,
+         density_column: cd108g1b225k0, mass_column: ca108g1b225k0, role: variant}
+      - {label: b225, beta: 2.25, gamma: 0.5, dp: 0, run: 109,
+         density_column: cd109g05b225k0, mass_column: ca109g05b225k0, role: variant}
+      - {label: b225, beta: 2.25, gamma: 0, dp: 0, run: 110,
+         density_column: cd110g0b225k0, mass_column: ca110g0b225k0, role: variant}
+
+    # Files registered for the sensitivity analysis, each run through
+    # `make pc-accept`: `b2` in acceptance mode (it must PASS against the
+    # submitted columns), the variants in informational mode (`--informational`),
+    # which reports every tier-1 number and decides nothing -- a declared
+    # parameter variant is expected to move, so a FAIL verdict would be
+    # meaningless. `mode` records which was used.
+    #
+    # Measure slots: `PC1` is the gamma = 1 run and `PC2` the gamma = 0 run --
+    # the paper's two measures. `PC3` is the gamma = 0.5 run at the same beta;
+    # it exists in this table only (`measures.accessibility` is unchanged).
+    input_files:
+      - {label: b2,  beta: 2.0, path: data/interim/pc_run_b2.gpkg,
+         layer: pc_run_b2,  PC1: cd1g1b2k0,    PC2: cd4g0b2k0,
+         PC3: cd106g05b2k0,
+         mode: acceptance,     role: reproduction}
+      - {label: b15, beta: 1.5, path: data/interim/pc_run_b15.gpkg,
+         layer: pc_run_b15, PC1: cd101g1b15k0, PC2: cd102g0b15k0,
+         PC3: cd105g05b15k0,
+         mode: informational,  role: variant}
+      - {label: b225, beta: 2.25, path: data/interim/pc_run_b225.gpkg,
+         layer: pc_run_b225, PC1: cd108g1b225k0, PC2: cd110g0b225k0,
+         PC3: cd109g05b225k0,
+         mode: informational,  role: variant}
+      - {label: b25, beta: 2.5, path: data/interim/pc_run_b25.gpkg,
+         layer: pc_run_b25, PC1: cd103g1b25k0, PC2: cd104g0b25k0,
+         PC3: cd107g05b25k0,
+         mode: informational,  role: variant}
+    # Stage 2 aggregates each of these to the 500 m grid under `intersects`
+    # and attaches them to the 9,030 frozen points by nearest segment, with the
+    # junction-tie rule (src/21_pc_beta_layers.py).
+    aggregated_layer: data/interim/pc_beta_aggregated_500m.gpkg
+    points_table: data/interim/pc_beta_points.csv
+    # Density-penalty (Dp) variants are outside the scope of the revision. The
+    # segment file and the aggregated layer carry Dp != 0 columns, documented
+    # in measures.pc_variant_parameters; they are not analysed.
+    # Columns are labelled by their parameters (measures.pc_variant_parameters),
+    # not by parsing the column name.
+    # Rank agreement between beta values is Spearman's rho.

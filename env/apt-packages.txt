@@ -1,0 +1,18 @@
+# System packages of the runs of record (Ubuntu 24.04). One package per line;
+# blank lines and # comments are ignored. Versions are those installed on the
+# machine of record.
+#
+# The GDAL / GEOS / PROJ stack that R's `sf` links against (the Python wheels
+# of geopandas/pyogrio/pyproj bundle their own):
+#   GDAL 3.8.4   (libgdal34t64 3.8.4+dfsg-3ubuntu3)
+#   GEOS 3.12.1  (libgeos3.12.1t64 3.12.1-3build1)
+#   PROJ 9.4.0   (libproj25 9.4.0-1build2)
+# Building `sf` from source additionally needs libgdal-dev, libgeos-dev,
+# libproj-dev and libudunits2-dev.
+#
+# QGIS 3.34 LTR (qgis / python3-qgis 3.34.4+dfsg-4build2) runs GAUS Lines v1.1
+# headless via `qgis_process` (`make gaus-native`). PyQGIS lives in the system
+# Python and must not be visible to the analysis environment -- see the README,
+# section "GAUS". It needs QT_QPA_PLATFORM=offscreen when there is no display.
+qgis
+python3-qgis

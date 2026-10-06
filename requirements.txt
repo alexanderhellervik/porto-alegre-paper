@@ -1,0 +1,17 @@
+# Python packages for the pipeline (Python 3.12), at the versions of the runs
+# of record.   pip install -r requirements.txt
+# prefcent is also shipped as a wheel for offline installs:
+#   pip install --no-deps env/wheels/prefcent-0.1.0-py3-none-any.whl
+# QGIS (for `make gaus-native`) is a system package and must not be installed
+# into this environment; see env/apt-packages.txt.
+numpy==2.5.2
+scipy==1.18.1
+pandas==3.0.5
+geopandas==1.1.4
+shapely==2.1.2
+pyproj==3.7.2
+pyogrio==0.13.0
+PyYAML==6.0.3
+openpyxl==3.1.5
+RapidFuzz==3.14.5
+prefcent==0.1.0

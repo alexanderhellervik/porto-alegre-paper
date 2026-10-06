@@ -1,0 +1,10 @@
+# Ruff configuration for the reproduction package.
+#
+# The data trees are inputs, not code. `data/frozen/network/` carries the three
+# scripts that build a routing graph, rebuild the static weight R and rerun the
+# submitted preferential-centrality run; they are distributed with the network
+# they describe and checksummed with it (data/SHA256SUMS), so the data trees
+# are excluded and
+# `ruff check .` / `ruff format .` cover `src/` only. Rule selection is left at
+# ruff's default.
+extend-exclude = ["data/frozen", "data/raw", "data/interim", "tools"]

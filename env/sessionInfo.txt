@@ -1,0 +1,40 @@
+R version 4.6.1 (2026-06-24)
+Platform: x86_64-pc-linux-gnu
+Running under: Ubuntu 24.04.3 LTS
+
+Matrix products: default
+BLAS:   /usr/lib/x86_64-linux-gnu/blas/libblas.so.3.12.0 
+LAPACK: /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3.12.0  LAPACK version 3.12.0
+
+locale:
+ [1] LC_CTYPE=C.UTF-8       LC_NUMERIC=C           LC_TIME=C.UTF-8       
+ [4] LC_COLLATE=C.UTF-8     LC_MONETARY=C.UTF-8    LC_MESSAGES=C.UTF-8   
+ [7] LC_PAPER=C.UTF-8       LC_NAME=C              LC_ADDRESS=C          
+[10] LC_TELEPHONE=C         LC_MEASUREMENT=C.UTF-8 LC_IDENTIFICATION=C   
+
+time zone: /UTC
+tzcode source: system (glibc)
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] yaml_2.3.12
+
+loaded via a namespace (and not attached):
+ [1] compiler_4.6.1     class_7.3-24       tools_4.6.1        DBI_1.3.0         
+ [5] parallel_4.6.1     otel_0.2.0         units_1.0-1        proxy_0.4-29      
+ [9] Rcpp_1.1.2         KernSmooth_2.23-27 grid_4.6.1         e1071_1.7-17      
+[13] classInt_0.4-11    sf_1.1-2          
+
+.libPaths():
+  /workspace/.Rlibrary
+  /usr/local/lib/R/site-library
+  /usr/lib/R/site-library
+  /usr/lib/R/library
+
+sf::sf_extSoftVersion():
+          GEOS           GDAL         proj.4 GDAL_with_GEOS     USE_PROJ_H 
+      "3.12.1"        "3.8.4"        "9.4.0"         "true"         "true" 
+          PROJ 
+       "9.4.0" 
