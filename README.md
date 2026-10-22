@@ -1,8 +1,8 @@
-# Land value and spatial centrality in Porto Alegre — reproduction package
+# Improved-property value and spatial centrality in Porto Alegre — reproduction package
 
-Code, data and configuration to reproduce every table of the revised
-manuscript and its Online Resource, and Figure 5, of *Comparing the performance of spatial centrality measures
-through predicting urban land values: Evidence from Porto Alegre, Brazil*,
+Code, data and configuration to reproduce every table of the article
+and its Online Resource, and Figure 5, of *Comparing the performance of spatial centrality measures
+through predicting improved-property values: Evidence from Porto Alegre, Brazil*,
 together with a validation gate that re-estimates the tables of the
 **submitted** (first-round) version from the same inputs and scores them
 against the printed values.
@@ -408,9 +408,10 @@ authors set. `prefcent` is distributed under its own licence (MIT) from PyPI.
 If you use this package, please cite the article and the two tools that
 compute the centrality measures:
 
-* Lucato de Aguilar, R., and A. Hellervik. Comparing the performance of
-  spatial centrality measures through predicting urban land values: Evidence
-  from Porto Alegre, Brazil. Under review at *Networks and Spatial Economics*.
+* Lucato de Aguilar, R., and A. Hellervik (2026). Comparing the performance of
+  spatial centrality measures through predicting improved-property values:
+  Evidence from Porto Alegre, Brazil. *Networks and Spatial Economics*, in press.
+  <https://doi.org/10.1007/s11067-026-09803-5>
 * Hellervik, A. (2026). prefcent v0.1.0 [software]. Zenodo.
   <https://doi.org/10.5281/zenodo.22643614>
 * Dalcin, G., and R. Krafta (2021). GAUS: Graph Analysis of Urban Systems
